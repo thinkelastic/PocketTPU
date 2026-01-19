@@ -140,6 +140,7 @@ wire        mem_write = dbus_grant & dbus_we;
 // 0x20000000 - 0x20001FFF : Terminal VRAM
 // 0x30000000 - 0x30FFFFFF : PSRAM (16MB) - heap
 // 0x40000000 - 0x400000FF : System registers
+// 0x50000000 - 0x500000FF : Dot product accelerator
 
 // Decode memory regions
 wire ram_select    = (mem_addr[31:16] == 16'b0);                    // 0x00000000-0x0000FFFF (64KB)
@@ -147,6 +148,7 @@ wire sdram_select  = (mem_addr[31:26] == 6'b000100);                // 0x1000000
 wire term_select   = (mem_addr[31:13] == 19'h10000);                // 0x20000000-0x20001FFF
 wire psram_select  = (mem_addr[31:24] == 8'h30);                    // 0x30000000-0x30FFFFFF (16MB)
 wire sysreg_select = (mem_addr[31:8] == 24'h400000);                // 0x40000000-0x400000FF
+wire accel_select  = (mem_addr[31:8] == 24'h500000);                // 0x50000000-0x500000FF (dot product accelerator)
 
 // ============================================
 // RAM using block RAM (64KB = 16384 x 32-bit words)
@@ -200,6 +202,25 @@ assign term_mem_wdata = mem_wdata;
 assign term_mem_wstrb = mem_wstrb;
 
 // ============================================
+// Dot Product Accelerator
+// ============================================
+wire [31:0] accel_rdata;
+wire accel_ready;
+
+dot_product_accel #(
+    .VEC_SIZE(16)
+) dot_accel (
+    .clk(clk),
+    .reset_n(reset_n),
+    .valid(mem_valid && accel_select),
+    .write(mem_write),
+    .addr(mem_addr[7:0]),
+    .wdata(mem_wdata),
+    .rdata(accel_rdata),
+    .ready(accel_ready)
+);
+
+// ============================================
 // System registers
 // ============================================
 // 0x00: SYS_STATUS   - Bit 0: always 1 (SDRAM ready), Bit 1: dataslot_allcomplete
@@ -250,6 +271,7 @@ reg psram_read_pending;
 reg psram_write_pending;
 reg psram_started;
 reg sysreg_pending;
+reg accel_pending;
 reg [31:0] pending_rdata;
 
 localparam BUS_NONE = 2'd0;
@@ -273,6 +295,7 @@ always @(posedge clk or posedge reset) begin
         psram_write_pending <= 0;
         psram_started <= 0;
         sysreg_pending <= 0;
+        accel_pending <= 0;
         sdram_rd <= 0;
         sdram_wr <= 0;
         sdram_addr <= 0;
@@ -331,6 +354,9 @@ always @(posedge clk or posedge reset) begin
             end else if (sysreg_select) begin
                 mem_pending <= 1;
                 sysreg_pending <= 1;
+            end else if (accel_select) begin
+                mem_pending <= 1;
+                accel_pending <= 1;
             end else begin
                 // Unknown region - return 0 immediately
                 if (dbus_grant) begin
@@ -423,6 +449,17 @@ always @(posedge clk or posedge reset) begin
                 end
                 mem_pending <= 0;
                 sysreg_pending <= 0;
+                pending_bus <= BUS_NONE;
+            end else if (accel_pending && accel_ready) begin
+                if (pending_bus == BUS_DBUS) begin
+                    dbus_ack <= 1;
+                    dbus_dat_miso <= accel_rdata;
+                end else begin
+                    ibus_ack <= 1;
+                    ibus_dat_miso <= accel_rdata;
+                end
+                mem_pending <= 0;
+                accel_pending <= 0;
                 pending_bus <= BUS_NONE;
             end
         end

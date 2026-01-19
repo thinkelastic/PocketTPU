@@ -4346,7 +4346,11 @@ module VexRiscv (
   assign DBusCachedPlugin_mmuBus_rsp_allowRead = 1'b1;
   assign DBusCachedPlugin_mmuBus_rsp_allowWrite = 1'b1;
   assign DBusCachedPlugin_mmuBus_rsp_allowExecute = 1'b1;
-  assign DBusCachedPlugin_mmuBus_rsp_isIoAccess = DBusCachedPlugin_mmuBus_rsp_physicalAddress[31];
+  // IO (uncacheable) regions: 0x2xxxxxxx (terminal), 0x4xxxxxxx (sysregs), 0x5xxxxxxx (accel), 0x8xxxxxxx+
+  assign DBusCachedPlugin_mmuBus_rsp_isIoAccess = DBusCachedPlugin_mmuBus_rsp_physicalAddress[31] ||
+                                                   (DBusCachedPlugin_mmuBus_rsp_physicalAddress[31:28] == 4'h2) ||
+                                                   (DBusCachedPlugin_mmuBus_rsp_physicalAddress[31:28] == 4'h4) ||
+                                                   (DBusCachedPlugin_mmuBus_rsp_physicalAddress[31:28] == 4'h5);
   assign DBusCachedPlugin_mmuBus_rsp_exception = 1'b0;
   assign DBusCachedPlugin_mmuBus_rsp_refilling = 1'b0;
   assign DBusCachedPlugin_mmuBus_busy = 1'b0;

@@ -6,8 +6,10 @@ A demonstration core featuring a VexRiscv RISC-V CPU running on the Analogue Poc
 
 - **VexRiscv RISC-V CPU** - Open source RV32IM processor with instruction/data caches
 - **LLaMA-2 Inference** - Run small language models directly on the Pocket
+- **Dot Product Accelerator** - Hardware DSP-based vector operations for neural network inference
 - **64KB BRAM** - Program and data storage
 - **64MB SDRAM** - External memory for model weights and heap
+- **16MB PSRAM** - Fast pseudo-SRAM for KV cache
 - **40x30 Text Terminal** - 1200 character display with 8x8 font
 - **Printf Support** - Standard printf-style formatted output
 - **320x240 @ 60Hz** - Native video output
@@ -30,6 +32,7 @@ A demonstration core featuring a VexRiscv RISC-V CPU running on the Analogue Poc
 │   │   ├── core/                 # Core implementation
 │   │   │   ├── core_top.v        # Top-level module
 │   │   │   ├── cpu_system.v      # VexRiscv + RAM + peripherals
+│   │   │   ├── dot_product_accel.v # Hardware dot product accelerator
 │   │   │   ├── text_terminal.v   # Text rendering
 │   │   │   └── io_sdram.v        # SDRAM controller
 │   │   └── vexriscv/             # VexRiscv CPU core
@@ -40,6 +43,7 @@ A demonstration core featuring a VexRiscv RISC-V CPU running on the Analogue Poc
 │       ├── terminal.c            # Terminal driver
 │       ├── terminal.h            # Terminal API
 │       ├── llama_embedded.c      # LLM inference engine
+│       ├── dot_accel.h           # Dot product accelerator driver
 │       ├── start.S               # Startup code
 │       ├── linker.ld             # Linker script
 │       └── Makefile              # Build system
@@ -61,10 +65,11 @@ A demonstration core featuring a VexRiscv RISC-V CPU running on the Analogue Poc
 | Parameter | Value |
 |-----------|-------|
 | Target FPGA | Cyclone V 5CEBA4F23C8 |
-| CPU Clock | ~57 MHz |
+| CPU Clock | 50 MHz |
 | Video Output | 320x240 @ 60Hz |
 | Program RAM | 64KB BRAM |
 | External RAM | 64MB SDRAM |
+| PSRAM | 16MB (CRAM0) |
 | VRAM | 1200 bytes (40x30 chars) |
 
 ### VexRiscv Configuration
@@ -83,6 +88,8 @@ A demonstration core featuring a VexRiscv RISC-V CPU running on the Analogue Poc
 | `0x00000000 - 0x0000FFFF` | 64KB | BRAM (program + data) |
 | `0x10000000 - 0x13FFFFFF` | 64MB | SDRAM |
 | `0x20000000 - 0x200004AF` | 1200B | VRAM (text terminal) |
+| `0x30000000 - 0x30FFFFFF` | 16MB | PSRAM (CRAM0) |
+| `0x50000000 - 0x500000FF` | 256B | Dot Product Accelerator |
 
 ## LLaMA-2 Inference
 
@@ -94,6 +101,7 @@ This core includes an embedded implementation of LLaMA-2 inference, adapted from
 - **Tokenizer**: BPE tokenizer with vocabulary embedded in firmware
 - **Inference**: Full transformer forward pass with attention, RMSNorm, and SwiGLU FFN
 - **Sampling**: Temperature and top-p (nucleus) sampling for text generation
+- **KV Cache**: Key/value cache stored in PSRAM for faster random access during attention
 
 ### Memory Layout
 
@@ -101,7 +109,8 @@ This core includes an embedded implementation of LLaMA-2 inference, adapted from
 |--------|---------|-------|
 | Model Weights | `0x10000000` | Transformer parameters from .bin file |
 | Tokenizer Data | `0x12000000` | Vocabulary and scores |
-| Runtime Heap | `0x12100000` | KV cache, activations, logits |
+| Runtime Heap | `0x12100000` | Activations, logits |
+| KV Cache | `0x30000000` | Key/value cache in PSRAM |
 
 ### Supported Models
 
@@ -117,6 +126,40 @@ Default settings in `llama_embedded.c`:
 - `DEFAULT_TEMPERATURE`: 1.0
 - `DEFAULT_TOPP`: 0.9 (nucleus sampling)
 - `DEFAULT_PROMPT`: "Once upon a time"
+- `USE_DOT_ACCEL`: 1 (enable hardware accelerator)
+
+## Dot Product Accelerator
+
+A custom hardware accelerator for dot product operations, used to speed up matrix-vector multiplications in the neural network.
+
+### Hardware Design
+
+- **4 parallel multipliers** using DSP blocks
+- **16-element vector registers** for batch processing
+- **Q16.16 fixed-point arithmetic** for weights and activations
+- **64-bit accumulator** to handle overflow from large vectors
+
+### Register Map
+
+| Offset | Register | Description |
+|--------|----------|-------------|
+| `0x00` | CTRL | Write 1 to start, bit 0 = busy status |
+| `0x04` | LENGTH | Vector length (1-16 elements) |
+| `0x08` | RESULT_LO | Low 32 bits of 64-bit result |
+| `0x0C` | RESULT_HI | High 32 bits of 64-bit result |
+| `0x10-0x4C` | VEC_A | First vector elements (16 words) |
+| `0x50-0x8C` | VEC_B | Second vector elements (16 words) |
+
+### Usage
+
+```c
+#include "dot_accel.h"
+
+// Compute dot product of two float vectors
+float result = dot_product_accel(vec_a, vec_b, length);
+```
+
+The accelerator handles vectors larger than 16 elements by batching. Weights can be pre-converted to Q16.16 format at startup to reduce runtime conversion overhead.
 
 ## Firmware Development
 
@@ -207,7 +250,7 @@ Copy both folders to your SD card root.
 VexRiscv was chosen over PicoRV32 for:
 - Hardware multiply/divide support (RV32IM)
 - Instruction and data caches for better performance
-- Pipelined design (~57 MHz clock)
+- Pipelined design (50 MHz clock)
 - Well-tested in LiteX projects
 
 ### Video Timing
@@ -218,8 +261,10 @@ Native 320x240 @ 60Hz output with 12.288 MHz pixel clock. The text terminal uses
 
 - Firmware BRAM uses altsyncram with MIF initialization
 - SDRAM provides 64MB for model weights and dynamic heap
+- PSRAM (CRAM0) provides 16MB for KV cache with faster random access
 - VRAM is memory-mapped and directly written by CPU
 - Wishbone bus with arbiter for instruction/data access
+- Dot product accelerator mapped to uncacheable I/O region (0x5xxxxxxx)
 
 ## License
 

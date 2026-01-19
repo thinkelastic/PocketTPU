@@ -166,9 +166,7 @@ static void malloc_run_state(RunState* s, Config* p) {
     s->hb2 = sdram_alloc(p->hidden_dim * sizeof(float));
     s->q = sdram_alloc(p->dim * sizeof(float));
 
-    /* KV cache - try PSRAM first for faster random access, fall back to SDRAM.
-     * NOTE: PSRAM seems to cause hangs during inference, using SDRAM for now. */
-    #if 0  /* Disabled - PSRAM causes hangs */
+    /* KV cache - use PSRAM for faster random access */
     s->key_cache = psram_cache_alloc(kv_cache_size);
     s->value_cache = psram_cache_alloc(kv_cache_size);
     if (!s->key_cache || !s->value_cache) {
@@ -176,13 +174,8 @@ static void malloc_run_state(RunState* s, Config* p) {
         s->key_cache = sdram_alloc(kv_cache_size);
         s->value_cache = sdram_alloc(kv_cache_size);
     } else {
-        printf("KV cache in fast PSRAM (%d KB x2)\n", kv_cache_size / 1024);
+        printf("KV cache in PSRAM (%d KB x2)\n", kv_cache_size / 1024);
     }
-    #else
-    s->key_cache = sdram_alloc(kv_cache_size);
-    s->value_cache = sdram_alloc(kv_cache_size);
-    printf("KV cache in SDRAM (%d KB x2)\n", kv_cache_size / 1024);
-    #endif
 
     s->att = sdram_alloc(p->n_heads * p->seq_len * sizeof(float));
     s->logits = sdram_alloc(p->vocab_size * sizeof(float));
@@ -291,26 +284,79 @@ static void softmax(float* x, int size) {
     }
 }
 
+/* Option: USE_DOT_ACCEL to use hardware accelerator with pre-converted weights */
+#define USE_DOT_ACCEL 1
+
+#if USE_DOT_ACCEL
+#include "dot_accel.h"
+
+/* Flag to track if weights have been converted */
+static int weights_converted = 0;
+
+/* Convert model weights from float to Q16.16 in-place.
+ * Call once at startup before inference. */
+static void convert_weights_to_q16(float* weights, size_t num_floats) {
+    int32_t* q16_weights = (int32_t*)weights;
+    for (size_t i = 0; i < num_floats; i++) {
+        q16_weights[i] = FLOAT_TO_Q16(weights[i]);
+    }
+}
+
+/* Pre-converted x vector buffer in BRAM (max hidden_dim=172 for stories15M) */
+static int32_t x_q16[256];
+
 static void matmul(float* xout, float* x, float* w, int n, int d) {
-    /* 4x loop unrolling for better performance */
+    /* W (d,n) @ x (n,) -> xout (d,)
+     * Weights are pre-converted to Q16.16, x is converted per call.
+     * Note: w is actually int32_t* (Q16.16) after conversion, but we keep
+     * the signature as float* to match callers.
+     */
+    int32_t* w_q16 = (int32_t*)w;
+
+    /* Pre-convert x vector to Q16.16 */
+    for (int j = 0; j < n; j++) {
+        x_q16[j] = FLOAT_TO_Q16(x[j]);
+    }
+
+    for (int i = 0; i < d; i++) {
+        int32_t* wi = w_q16 + i * n;
+        int64_t total = 0;
+        int offset = 0;
+
+        while (offset < n) {
+            int batch = (n - offset > DOT_ACCEL_VEC_SIZE) ? DOT_ACCEL_VEC_SIZE : (n - offset);
+
+            for (int j = 0; j < batch; j++) {
+                dot_accel_load_a(j, wi[offset + j]);
+                dot_accel_load_b(j, x_q16[offset + j]);
+            }
+
+            dot_accel_set_length(batch);
+            dot_accel_start();
+            dot_accel_wait();
+
+            total += dot_accel_get_result();
+            offset += batch;
+        }
+
+        xout[i] = Q32_TO_FLOAT(total);
+    }
+}
+#else
+static void matmul(float* xout, float* x, float* w, int n, int d) {
+    /* W (d,n) @ x (n,) -> xout (d,)
+     * Software implementation - simple and correct.
+     */
     for (int i = 0; i < d; i++) {
         float val = 0.0f;
         float* wi = w + i * n;
-        int j = 0;
-        /* Process 4 elements at a time */
-        for (; j + 3 < n; j += 4) {
-            val += wi[j] * x[j];
-            val += wi[j+1] * x[j+1];
-            val += wi[j+2] * x[j+2];
-            val += wi[j+3] * x[j+3];
-        }
-        /* Handle remaining elements */
-        for (; j < n; j++) {
+        for (int j = 0; j < n; j++) {
             val += wi[j] * x[j];
         }
         xout[i] = val;
     }
 }
+#endif
 
 static float* forward(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
@@ -875,7 +921,7 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
         while(1);
     }
 
-    long start = 0;
+    uint64_t start_cycles = 0;
     int next;
     int token = prompt_tokens[0];
     int pos = 0;
@@ -896,14 +942,23 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
         safe_printf(piece);
         token = next;
 
-        if (start == 0) { start = time(NULL); }
+        if (start_cycles == 0) {
+            /* Start timing after first token (prompt processing) */
+            start_cycles = ((uint64_t)SYS_CYCLE_HI << 32) | SYS_CYCLE_LO;
+        }
     }
     printf("\n");
 
-    if (pos > 1) {
-        long end = time(NULL);
-        if (end > start) {
-            printf("Speed: %d tok/s\n", (int)((pos-1) / (end-start)));
+    if (pos > 1 && start_cycles > 0) {
+        uint64_t end_cycles = ((uint64_t)SYS_CYCLE_HI << 32) | SYS_CYCLE_LO;
+        uint64_t elapsed_cycles = end_cycles - start_cycles;
+        /* CPU runs at 50MHz, so cycles / 50000 = milliseconds */
+        uint32_t elapsed_ms = (uint32_t)(elapsed_cycles / 50000);
+        int tokens_generated = pos - 1;
+        if (elapsed_ms > 0) {
+            /* tokens per minute = tokens * 60000 / elapsed_ms */
+            uint32_t tok_per_min = (uint32_t)((uint64_t)tokens_generated * 60000 / elapsed_ms);
+            printf("Speed: %d tok/min (%d ms total)\n", tok_per_min, elapsed_ms);
         }
     }
 
@@ -964,6 +1019,42 @@ void llama_main(void) {
     build_transformer_from_memory(&transformer, (void*)MODEL_SDRAM_ADDR, 0);
     printf("Model: dim=%d layers=%d vocab=%d\n",
            transformer.config.dim, transformer.config.n_layers, transformer.config.vocab_size);
+
+#if USE_DOT_ACCEL
+    /* Convert weight matrices from float to Q16.16 for hardware accelerator.
+     * We convert all matmul weights but NOT:
+     * - token_embedding_table (used for lookup, not matmul)
+     * - rms weights (used element-wise, not matmul)
+     * - freq_cis (not used)
+     */
+    {
+        Config* p = &transformer.config;
+        TransformerWeights* w = &transformer.weights;
+        int head_size = p->dim / p->n_heads;
+        size_t n_layers = p->n_layers;
+
+        printf("Converting weights to Q16.16...\n");
+
+        /* wq, wk, wv, wo - attention weights */
+        convert_weights_to_q16(w->wq, n_layers * p->dim * (p->n_heads * head_size));
+        convert_weights_to_q16(w->wk, n_layers * p->dim * (p->n_kv_heads * head_size));
+        convert_weights_to_q16(w->wv, n_layers * p->dim * (p->n_kv_heads * head_size));
+        convert_weights_to_q16(w->wo, n_layers * (p->n_heads * head_size) * p->dim);
+
+        /* w1, w2, w3 - FFN weights */
+        convert_weights_to_q16(w->w1, n_layers * p->dim * p->hidden_dim);
+        convert_weights_to_q16(w->w2, n_layers * p->hidden_dim * p->dim);
+        convert_weights_to_q16(w->w3, n_layers * p->dim * p->hidden_dim);
+
+        /* wcls - output projection (may be shared with embedding) */
+        if (w->wcls != w->token_embedding_table) {
+            convert_weights_to_q16(w->wcls, p->vocab_size * p->dim);
+        }
+
+        weights_converted = 1;
+        printf("Weights converted!\n");
+    }
+#endif
 
     /* Build tokenizer from SDRAM */
     Tokenizer tokenizer;
