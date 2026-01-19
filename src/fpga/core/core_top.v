@@ -321,6 +321,15 @@ wire    [31:0]  ram1_word_q;
 wire            ram1_word_busy;
 wire            ram1_word_q_valid;
 
+// DMA accelerator burst interface signals
+wire            dma_burst_rd;
+wire    [24:0]  dma_burst_addr;
+wire    [10:0]  dma_burst_len;
+wire            dma_burst_32bit;
+wire    [31:0]  dma_burst_data;
+wire            dma_burst_data_valid;
+wire            dma_burst_data_done;
+
 // CPU runs at same clock as SDRAM controller (133 MHz) - no CDC needed!
 // Direct connection to ram1_word_q since same clock domain
 
@@ -716,6 +725,14 @@ assign video_hs = vidout_hs;
     wire [31:0] term_mem_rdata;
     wire        term_mem_ready;
 
+    // DMA accelerator register interface signals
+    wire        accel_reg_valid;
+    wire        accel_reg_write;
+    wire [7:0]  accel_reg_addr;
+    wire [31:0] accel_reg_wdata;
+    wire [31:0] accel_reg_rdata;
+    wire        accel_reg_ready;
+
     // VexRiscv CPU system - run at 133 MHz (same as SDRAM controller, no CDC needed)
     cpu_system cpu (
         .clk(clk_ram_controller),  // 133 MHz - same as SDRAM controller
@@ -743,7 +760,38 @@ assign video_hs = vidout_hs;
         .psram_addr(cpu_psram_addr),
         .psram_wdata(cpu_psram_wdata),
         .psram_rdata(cpu_psram_rdata),
-        .psram_busy(cpu_psram_busy)
+        .psram_busy(cpu_psram_busy),
+        // DMA accelerator register interface
+        .accel_reg_valid(accel_reg_valid),
+        .accel_reg_write(accel_reg_write),
+        .accel_reg_addr(accel_reg_addr),
+        .accel_reg_wdata(accel_reg_wdata),
+        .accel_reg_rdata(accel_reg_rdata),
+        .accel_reg_ready(accel_reg_ready)
+    );
+
+    // DMA Dot Product Accelerator
+    // Has direct access to SDRAM burst interface for high-bandwidth data transfer
+    dma_dot_product #(
+        .MAX_LENGTH(256)
+    ) dma_accel (
+        .clk(clk_ram_controller),
+        .reset_n(reset_n),
+        // CPU register interface
+        .reg_valid(accel_reg_valid),
+        .reg_write(accel_reg_write),
+        .reg_addr(accel_reg_addr),
+        .reg_wdata(accel_reg_wdata),
+        .reg_rdata(accel_reg_rdata),
+        .reg_ready(accel_reg_ready),
+        // SDRAM burst interface
+        .burst_rd(dma_burst_rd),
+        .burst_addr(dma_burst_addr),
+        .burst_len(dma_burst_len),
+        .burst_32bit(dma_burst_32bit),
+        .burst_data(dma_burst_data),
+        .burst_data_valid(dma_burst_data_valid),
+        .burst_data_done(dma_burst_data_done)
     );
 
     // Terminal display (40x30 characters, 320x240 pixels)
@@ -921,14 +969,14 @@ io_sdram isr0 (
     .phy_dq         ( dram_dq ),
     .phy_dqm        ( dram_dqm ),
 
-    // Burst interface - not used
-    .burst_rd           ( 1'b0 ),
-    .burst_addr         ( 25'b0 ),
-    .burst_len          ( 11'b0 ),
-    .burst_32bit        ( 1'b0 ),
-    .burst_data         ( ),
-    .burst_data_valid   ( ),
-    .burst_data_done    ( ),
+    // Burst interface - used by DMA accelerator
+    .burst_rd           ( dma_burst_rd ),
+    .burst_addr         ( dma_burst_addr ),
+    .burst_len          ( dma_burst_len ),
+    .burst_32bit        ( dma_burst_32bit ),
+    .burst_data         ( dma_burst_data ),
+    .burst_data_valid   ( dma_burst_data_valid ),
+    .burst_data_done    ( dma_burst_data_done ),
 
     // Burst write interface - not used
     .burstwr        ( 1'b0 ),

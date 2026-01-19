@@ -284,11 +284,11 @@ static void softmax(float* x, int size) {
     }
 }
 
-/* Option: USE_DOT_ACCEL to use hardware accelerator with pre-converted weights */
-#define USE_DOT_ACCEL 1
+/* Option: USE_DMA_ACCEL to use DMA hardware accelerator with pre-converted weights */
+#define USE_DMA_ACCEL 1
 
-#if USE_DOT_ACCEL
-#include "dot_accel.h"
+#if USE_DMA_ACCEL
+#include "dma_dot_accel.h"
 
 /* Flag to track if weights have been converted */
 static int weights_converted = 0;
@@ -302,44 +302,29 @@ static void convert_weights_to_q16(float* weights, size_t num_floats) {
     }
 }
 
-/* Pre-converted x vector buffer in BRAM (max hidden_dim=172 for stories15M) */
-static int32_t x_q16[256];
+/* SDRAM buffer for x vector - allocated at startup
+ * DMA can only read from SDRAM, so we copy x here before each matmul */
+static int32_t* x_sdram_buf = NULL;
 
 static void matmul(float* xout, float* x, float* w, int n, int d) {
     /* W (d,n) @ x (n,) -> xout (d,)
-     * Weights are pre-converted to Q16.16, x is converted per call.
-     * Note: w is actually int32_t* (Q16.16) after conversion, but we keep
-     * the signature as float* to match callers.
+     * Weights are pre-converted to Q16.16 and stored in SDRAM.
+     * x is converted to Q16.16 and copied to SDRAM buffer for DMA.
      */
     int32_t* w_q16 = (int32_t*)w;
 
-    /* Pre-convert x vector to Q16.16 */
+    /* Convert and copy x vector to SDRAM buffer for DMA */
     for (int j = 0; j < n; j++) {
-        x_q16[j] = FLOAT_TO_Q16(x[j]);
+        x_sdram_buf[j] = FLOAT_TO_Q16(x[j]);
     }
 
+    /* Compute each output element using DMA dot product */
     for (int i = 0; i < d; i++) {
         int32_t* wi = w_q16 + i * n;
-        int64_t total = 0;
-        int offset = 0;
 
-        while (offset < n) {
-            int batch = (n - offset > DOT_ACCEL_VEC_SIZE) ? DOT_ACCEL_VEC_SIZE : (n - offset);
-
-            for (int j = 0; j < batch; j++) {
-                dot_accel_load_a(j, wi[offset + j]);
-                dot_accel_load_b(j, x_q16[offset + j]);
-            }
-
-            dot_accel_set_length(batch);
-            dot_accel_start();
-            dot_accel_wait();
-
-            total += dot_accel_get_result();
-            offset += batch;
-        }
-
-        xout[i] = Q32_TO_FLOAT(total);
+        /* Use DMA accelerator - it fetches both vectors from SDRAM */
+        int64_t result = dma_dot_product_q16(wi, x_sdram_buf, n);
+        xout[i] = Q32_TO_FLOAT(result);
     }
 }
 #else
@@ -1020,7 +1005,19 @@ void llama_main(void) {
     printf("Model: dim=%d layers=%d vocab=%d\n",
            transformer.config.dim, transformer.config.n_layers, transformer.config.vocab_size);
 
-#if USE_DOT_ACCEL
+#if USE_DMA_ACCEL
+    /* Allocate SDRAM buffer for x vector (used by DMA accelerator) */
+    {
+        int max_dim = transformer.config.dim > transformer.config.hidden_dim ?
+                      transformer.config.dim : transformer.config.hidden_dim;
+        x_sdram_buf = sdram_alloc(max_dim * sizeof(int32_t));
+        if (!x_sdram_buf) {
+            printf("ERROR: failed to allocate x_sdram_buf!\n");
+            while(1);
+        }
+        printf("DMA x buffer allocated (%d words)\n", max_dim);
+    }
+
     /* Convert weight matrices from float to Q16.16 for hardware accelerator.
      * We convert all matmul weights but NOT:
      * - token_embedding_table (used for lookup, not matmul)

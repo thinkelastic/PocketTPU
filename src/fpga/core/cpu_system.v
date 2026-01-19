@@ -40,7 +40,15 @@ module cpu_system (
     output reg  [21:0] psram_addr,
     output reg  [31:0] psram_wdata,
     input wire  [31:0] psram_rdata,
-    input wire         psram_busy
+    input wire         psram_busy,
+
+    // DMA accelerator register interface (directly exposed to core_top)
+    output wire        accel_reg_valid,
+    output wire        accel_reg_write,
+    output wire [7:0]  accel_reg_addr,
+    output wire [31:0] accel_reg_wdata,
+    input wire  [31:0] accel_reg_rdata,
+    input wire         accel_reg_ready
 );
 
 // ============================================
@@ -202,23 +210,17 @@ assign term_mem_wdata = mem_wdata;
 assign term_mem_wstrb = mem_wstrb;
 
 // ============================================
-// Dot Product Accelerator
+// DMA Dot Product Accelerator (in core_top.v)
 // ============================================
-wire [31:0] accel_rdata;
-wire accel_ready;
+// The accelerator is instantiated in core_top.v because it needs direct
+// access to the SDRAM burst interface. We just expose the register interface here.
+assign accel_reg_valid = mem_valid && accel_select;
+assign accel_reg_write = mem_write;
+assign accel_reg_addr = mem_addr[7:0];
+assign accel_reg_wdata = mem_wdata;
 
-dot_product_accel #(
-    .VEC_SIZE(16)
-) dot_accel (
-    .clk(clk),
-    .reset_n(reset_n),
-    .valid(mem_valid && accel_select),
-    .write(mem_write),
-    .addr(mem_addr[7:0]),
-    .wdata(mem_wdata),
-    .rdata(accel_rdata),
-    .ready(accel_ready)
-);
+wire [31:0] accel_rdata = accel_reg_rdata;
+wire accel_ready = accel_reg_ready;
 
 // ============================================
 // System registers
