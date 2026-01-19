@@ -1,5 +1,5 @@
 Analysis & Synthesis report for ap_core
-Wed Jan 14 17:48:23 2026
+Mon Jan 19 11:43:44 2026
 Quartus Prime Version 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
 
 
@@ -37,7 +37,7 @@ on the Quartus Prime software download page.
 +-------------------------------------------------------------------------------+
 ; Analysis & Synthesis Summary                                                  ;
 +-----------------------------+-------------------------------------------------+
-; Analysis & Synthesis Status ; Failed - Wed Jan 14 17:48:23 2026               ;
+; Analysis & Synthesis Status ; Failed - Mon Jan 19 11:43:44 2026               ;
 ; Quartus Prime Version       ; 25.1std.0 Build 1129 10/21/2025 SC Lite Edition ;
 ; Revision Name               ; ap_core                                         ;
 ; Top-level Entity Name       ; ap_core                                         ;
@@ -161,16 +161,16 @@ on the Quartus Prime software download page.
 Info: *******************************************************************
 Info: Running Quartus Prime Analysis & Synthesis
     Info: Version 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
-    Info: Processing started: Wed Jan 14 17:48:21 2026
+    Info: Processing started: Mon Jan 19 11:43:41 2026
 Info: Command: quartus_map --read_settings_files=on --write_settings_files=off ap_core -c ap_core
 Info (20034): Auto device selection is not supported for Cyclone V device family. The default device, 5CGXFC7C7F23C8, is set.
 Warning (18236): Number of processors has not been specified which may cause overloading on shared machines.  Set the global assignment NUM_PARALLEL_PROCESSORS in your QSF to an appropriate value for best performance.
 Info (20030): Parallel compilation is enabled and will use 16 of the 32 processors detected
 Error (12007): Top-level design entity "ap_core" is undefined
 Error: Quartus Prime Analysis & Synthesis was unsuccessful. 1 error, 1 warning
-    Error: Peak virtual memory: 393 megabytes
-    Error: Processing ended: Wed Jan 14 17:48:23 2026
-    Error: Elapsed time: 00:00:02
+    Error: Peak virtual memory: 396 megabytes
+    Error: Processing ended: Mon Jan 19 11:43:44 2026
+    Error: Elapsed time: 00:00:03
     Error: Total CPU time (on all processors): 00:00:08
 
 

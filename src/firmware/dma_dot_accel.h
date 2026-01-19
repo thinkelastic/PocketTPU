@@ -20,8 +20,8 @@
 #define DMA_DOT_ADDR_A    (DMA_DOT_ACCEL_BASE + 0x10)
 #define DMA_DOT_ADDR_B    (DMA_DOT_ACCEL_BASE + 0x14)
 
-// Maximum vector size per batch
-#define DMA_DOT_MAX_LEN   256
+// Maximum vector size per batch (increased to 512 for B-caching optimization)
+#define DMA_DOT_MAX_LEN   512
 
 // Memory-mapped register access
 #define REG32(addr) (*(volatile uint32_t *)(addr))
@@ -54,9 +54,24 @@ static inline void dma_dot_wait(void) {
     }
 }
 
-// Start accelerator computation
+// Control register bits
+#define DMA_DOT_CTRL_START       (1 << 0)  // Start operation
+#define DMA_DOT_CTRL_USE_CACHED  (1 << 1)  // Use cached B vector
+#define DMA_DOT_CTRL_PRELOAD_B   (1 << 2)  // Preload B only, no compute
+
+// Start accelerator computation (normal mode)
 static inline void dma_dot_start(void) {
-    REG32(DMA_DOT_CTRL) = 1;
+    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START;
+}
+
+// Preload B vector into cache (CTRL=5: preload_b_only + start)
+static inline void dma_dot_preload_b(void) {
+    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_PRELOAD_B;
+}
+
+// Start computation using cached B (CTRL=3: use_cached_b + start)
+static inline void dma_dot_start_cached(void) {
+    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_USE_CACHED;
 }
 
 // Set vector length
@@ -119,6 +134,41 @@ static inline int64_t dma_dot_product_q16(int32_t* a, int32_t* b, int n) {
     }
 
     return total;
+}
+
+/*
+ * Preload B vector into hardware cache for repeated use.
+ * Call this once before calling dma_dot_product_q16_cached() multiple times.
+ * Only works for vectors <= DMA_DOT_MAX_LEN (256 elements).
+ *
+ * Parameters:
+ *   b: Pointer to B vector in SDRAM (Q16.16 format)
+ *   n: Number of elements (must be <= 256)
+ */
+static inline void dma_dot_preload_b_vector(int32_t* b, int n) {
+    dma_dot_set_addr_b(ptr_to_sdram_word_addr(b));
+    dma_dot_set_length(n);
+    dma_dot_preload_b();
+    dma_dot_wait();
+}
+
+/*
+ * Compute dot product using cached B vector (preloaded with dma_dot_preload_b_vector).
+ * Only fetches vector A from SDRAM - uses previously cached B.
+ * Only works for vectors <= DMA_DOT_MAX_LEN (256 elements).
+ *
+ * Parameters:
+ *   a: Pointer to A vector in SDRAM (Q16.16 format)
+ *   n: Number of elements (must match preloaded B length)
+ *
+ * Returns: 64-bit Q32.32 result
+ */
+static inline int64_t dma_dot_product_q16_cached(int32_t* a, int n) {
+    dma_dot_set_addr_a(ptr_to_sdram_word_addr(a));
+    dma_dot_set_length(n);
+    dma_dot_start_cached();
+    dma_dot_wait();
+    return dma_dot_get_result();
 }
 
 #endif // DMA_DOT_ACCEL_H

@@ -4,19 +4,18 @@
 // Memory-mapped interface at 0x50000000
 //
 // Registers:
-//   0x00: CTRL       - Write 1 to start, read for status (bit 0 = busy)
+//   0x00: CTRL       - Write to start, read for status (bit 0 = busy)
+//                      Write bits: [0]=start, [1]=use_cached_b, [2]=preload_b_only
 //   0x04: LENGTH     - Vector length in elements (up to 256)
 //   0x08: RESULT_LO  - Low 32 bits of accumulated result
 //   0x0C: RESULT_HI  - High 32 bits of accumulated result
 //   0x10: ADDR_A     - SDRAM word address for vector A (24-bit)
 //   0x14: ADDR_B     - SDRAM word address for vector B (24-bit)
 //
-// Operation:
-//   1. Write SDRAM word addresses for vectors A and B
-//   2. Write vector length to LENGTH register
-//   3. Write 1 to CTRL to start DMA and computation
-//   4. Poll CTRL until bit 0 is 0 (not busy)
-//   5. Read RESULT_LO (and RESULT_HI if needed)
+// Operation modes:
+//   Normal (CTRL=1): Fetch A and B from SDRAM, compute dot product
+//   Preload B (CTRL=5): Fetch B into cache, no computation
+//   Use cached B (CTRL=3): Fetch only A, use cached B, compute dot product
 //
 // Vectors are Q16.16 fixed-point (pre-converted by firmware)
 // Result is 64-bit to handle overflow from accumulation
@@ -25,7 +24,7 @@
 `default_nettype none
 
 module dma_dot_product #(
-    parameter MAX_LENGTH = 256    // Maximum vector length
+    parameter MAX_LENGTH = 512    // Maximum vector length (increased for B-caching)
 ) (
     input wire clk,
     input wire reset_n,
@@ -50,12 +49,17 @@ module dma_dot_product #(
 
 // Control/status
 reg busy;
-reg [8:0] vec_length;        // Up to 256 elements
+reg [9:0] vec_length;        // Up to 512 elements
 reg signed [63:0] accumulator;
 
 // Address registers
 reg [23:0] addr_a;
 reg [23:0] addr_b;
+
+// B-caching control
+reg use_cached_b;           // Use cached B instead of fetching
+reg preload_b_only;         // Only preload B, no computation
+reg [9:0] cached_b_length;  // Length of cached B vector
 
 // State machine
 localparam STATE_IDLE     = 3'd0;
@@ -74,10 +78,10 @@ reg signed [31:0] vec_a [0:MAX_LENGTH-1];
 reg signed [31:0] vec_b [0:MAX_LENGTH-1];
 
 // Fetch counters
-reg [8:0] fetch_idx;
+reg [9:0] fetch_idx;
 
 // Computation pipeline
-reg [8:0] comp_idx;
+reg [9:0] comp_idx;
 
 // Pipeline registers for multiply-accumulate
 // Stage 1: read operands
@@ -99,7 +103,7 @@ reg [31:0] rdata_comb;
 always @(*) begin
     case (reg_addr[7:2])
         6'h00: rdata_comb = {31'b0, busy};           // CTRL/STATUS
-        6'h01: rdata_comb = {23'b0, vec_length};    // LENGTH
+        6'h01: rdata_comb = {22'b0, vec_length};    // LENGTH (10 bits, up to 512)
         6'h02: rdata_comb = accumulator[31:0];      // RESULT_LO
         6'h03: rdata_comb = accumulator[63:32];     // RESULT_HI
         6'h04: rdata_comb = {8'b0, addr_a};         // ADDR_A
@@ -120,6 +124,9 @@ always @(posedge clk or negedge reset_n) begin
         accumulator <= 0;
         addr_a <= 0;
         addr_b <= 0;
+        use_cached_b <= 0;
+        preload_b_only <= 0;
+        cached_b_length <= 0;
         state <= STATE_IDLE;
         burst_rd <= 0;
         burst_addr <= 0;
@@ -147,17 +154,30 @@ always @(posedge clk or negedge reset_n) begin
             case (reg_addr[7:2])
                 6'h00: begin  // CTRL
                     if (reg_wdata[0]) begin
-                        // Start computation
+                        // Start operation
+                        // Bit 0: start
+                        // Bit 1: use cached B (skip B fetch)
+                        // Bit 2: preload B only (fetch B, no A, no compute)
                         busy <= 1;
-                        state <= STATE_FETCH_A;
+                        use_cached_b <= reg_wdata[1];
+                        preload_b_only <= reg_wdata[2];
                         accumulator <= 0;
                         fetch_idx <= 0;
                         comp_idx <= 0;
                         pipe1_valid <= 0;
                         pipe2_valid <= 0;
+
+                        if (reg_wdata[2]) begin
+                            // Preload B only mode - go directly to fetch B
+                            state <= STATE_FETCH_B;
+                            cached_b_length <= vec_length;  // Save length for later use
+                        end else begin
+                            // Normal or use-cached-B mode - start with fetch A
+                            state <= STATE_FETCH_A;
+                        end
                     end
                 end
-                6'h01: vec_length <= reg_wdata[8:0];
+                6'h01: vec_length <= reg_wdata[9:0];
                 6'h04: addr_a <= reg_wdata[23:0];
                 6'h05: addr_b <= reg_wdata[23:0];
                 default: ;
@@ -189,8 +209,17 @@ always @(posedge clk or negedge reset_n) begin
                     fetch_idx <= fetch_idx + 1;
                 end
                 if (burst_data_done) begin
-                    state <= STATE_FETCH_B;
                     fetch_idx <= 0;
+                    if (use_cached_b) begin
+                        // Skip B fetch, go directly to compute using cached B
+                        state <= STATE_COMPUTE;
+                        comp_idx <= 0;
+                        pipe1_valid <= 0;
+                        pipe2_valid <= 0;
+                    end else begin
+                        // Normal mode - fetch B
+                        state <= STATE_FETCH_B;
+                    end
                 end
             end
 
@@ -212,10 +241,16 @@ always @(posedge clk or negedge reset_n) begin
                     fetch_idx <= fetch_idx + 1;
                 end
                 if (burst_data_done) begin
-                    state <= STATE_COMPUTE;
-                    comp_idx <= 0;
-                    pipe1_valid <= 0;
-                    pipe2_valid <= 0;
+                    if (preload_b_only) begin
+                        // Preload complete - go directly to done, no compute
+                        state <= STATE_DONE;
+                    end else begin
+                        // Normal mode - proceed to compute
+                        state <= STATE_COMPUTE;
+                        comp_idx <= 0;
+                        pipe1_valid <= 0;
+                        pipe2_valid <= 0;
+                    end
                 end
             end
 

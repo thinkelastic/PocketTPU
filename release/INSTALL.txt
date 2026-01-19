@@ -1,7 +1,7 @@
 Analogue Pocket Core Installation Instructions
 ================================================
 
-Core: ThinkElastic.Homebrew
+Core: ThinkElastic.PocketTPU
 
 Installation Steps:
 -------------------
@@ -15,7 +15,7 @@ Installation Steps:
 
 4. Power on your Analogue Pocket
 
-5. Navigate to the "Cores" menu and select "ThinkElastic.Homebrew"
+5. Navigate to the "Cores" menu and select "ThinkElastic.PocketTPU"
 
 Directory Structure:
 --------------------
@@ -23,11 +23,11 @@ Your SD card should have this structure:
 
 SD Card Root/
 +-- Assets/
-|   +-- homebrew/
+|   +-- pockettpu/
 |       +-- common/
 |           +-- firmware.bin
 +-- Cores/
-|   +-- ThinkElastic.Homebrew/
+|   +-- ThinkElastic.PocketTPU/
 |       +-- bitstream.rbf_r
 |       +-- core.json
 |       +-- video.json
@@ -39,8 +39,8 @@ SD Card Root/
 |       +-- icon.bin
 +-- Platforms/
     +-- _images/
-    |   +-- homebrew.bin
-    +-- homebrew.json
+    |   +-- pockettpu.bin
+    +-- pockettpu.json
 
 Troubleshooting:
 ----------------

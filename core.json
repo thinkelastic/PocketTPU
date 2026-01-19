@@ -2,9 +2,9 @@
     "core": {
         "magic": "APF_VER_1",
         "metadata": {
-            "platform_ids": ["homebrew"],
-            "shortname": "homebrew",
-            "description": "VexRiscv RISC-V CPU demonstration core with text display",
+            "platform_ids": ["pockettpu"],
+            "shortname": "pockettpu",
+            "description": "VexRiscv RISC-V CPU with LLaMA-2 inference",
             "author": "ThinkElastic",
             "url": "",
             "version": "1.0.0",

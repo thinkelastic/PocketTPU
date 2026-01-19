@@ -2,7 +2,7 @@
 # Replaces build.sh and build-quick.sh
 
 # Configuration
-CORE_NAME = ThinkElastic.Homebrew
+CORE_NAME = ThinkElastic.PocketTPU
 QUARTUS_PROJECT = ap_core
 
 # Directories
@@ -11,7 +11,7 @@ FIRMWARE_DIR = src/firmware
 OUTPUT_DIR = release
 RELEASE_CORE_DIR = $(OUTPUT_DIR)/Cores/$(CORE_NAME)
 RELEASE_PLATFORMS_DIR = $(OUTPUT_DIR)/Platforms
-RELEASE_ASSETS_DIR = $(OUTPUT_DIR)/Assets/homebrew/common
+RELEASE_ASSETS_DIR = $(OUTPUT_DIR)/Assets/pockettpu/common
 
 # Files
 BITSTREAM_SOURCE = $(FPGA_DIR)/output_files/$(QUARTUS_PROJECT).rbf
@@ -135,7 +135,7 @@ Your SD card should have this structure:
 
 SD Card Root/
 +-- Assets/
-|   +-- homebrew/
+|   +-- pockettpu/
 |       +-- common/
 |           +-- firmware.bin
 +-- Cores/
@@ -151,8 +151,8 @@ SD Card Root/
 |       +-- icon.bin
 +-- Platforms/
     +-- _images/
-    |   +-- homebrew.bin
-    +-- homebrew.json
+    |   +-- pockettpu.bin
+    +-- pockettpu.json
 
 Troubleshooting:
 ----------------

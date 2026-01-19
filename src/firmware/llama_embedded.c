@@ -310,6 +310,10 @@ static void matmul(float* xout, float* x, float* w, int n, int d) {
     /* W (d,n) @ x (n,) -> xout (d,)
      * Weights are pre-converted to Q16.16 and stored in SDRAM.
      * x is converted to Q16.16 and copied to SDRAM buffer for DMA.
+     *
+     * Optimization: Use B-caching when n <= 256 (single batch).
+     * Preload x vector once, then use cached B for all d rows.
+     * This halves DMA bandwidth since x is only fetched once.
      */
     int32_t* w_q16 = (int32_t*)w;
 
@@ -318,13 +322,24 @@ static void matmul(float* xout, float* x, float* w, int n, int d) {
         x_sdram_buf[j] = FLOAT_TO_Q16(x[j]);
     }
 
-    /* Compute each output element using DMA dot product */
-    for (int i = 0; i < d; i++) {
-        int32_t* wi = w_q16 + i * n;
+    if (n <= DMA_DOT_MAX_LEN) {
+        /* Single batch - use B-caching optimization */
+        /* Preload x vector (stored as B in hardware) once */
+        dma_dot_preload_b_vector(x_sdram_buf, n);
 
-        /* Use DMA accelerator - it fetches both vectors from SDRAM */
-        int64_t result = dma_dot_product_q16(wi, x_sdram_buf, n);
-        xout[i] = Q32_TO_FLOAT(result);
+        /* Compute each output element using cached B */
+        for (int i = 0; i < d; i++) {
+            int32_t* wi = w_q16 + i * n;
+            int64_t result = dma_dot_product_q16_cached(wi, n);
+            xout[i] = Q32_TO_FLOAT(result);
+        }
+    } else {
+        /* Multiple batches needed - use standard method */
+        for (int i = 0; i < d; i++) {
+            int32_t* wi = w_q16 + i * n;
+            int64_t result = dma_dot_product_q16(wi, x_sdram_buf, n);
+            xout[i] = Q32_TO_FLOAT(result);
+        }
     }
 }
 #else
