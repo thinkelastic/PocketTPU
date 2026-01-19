@@ -204,4 +204,9 @@ clean-fpga: clean-fpga-cache
 # Quick target (alias for package)
 quick: package
 
-.PHONY: all full fpga firmware-mif firmware firmware-update fw package check-bitstream release-dirs copy-bitstream copy-json copy-platform copy-icon install-txt clean clean-fpga-cache clean-fpga quick
+# Program FPGA via JTAG (for development)
+program: firmware-mif
+	@echo "Programming FPGA via JTAG..."
+	$(MAKE) -C $(FPGA_DIR) program
+
+.PHONY: all full fpga firmware-mif firmware firmware-update fw package check-bitstream release-dirs copy-bitstream copy-json copy-platform copy-icon install-txt clean clean-fpga-cache clean-fpga quick program

@@ -35,6 +35,25 @@ static void* sdram_alloc(size_t size) {
     return ptr;
 }
 
+/* Fast PSRAM arena for KV cache - PSRAM is ~3-5x faster than SDRAM for random access.
+ * PSRAM is 8MB total (only CRAM0 is connected, CRAM1 is tied off).
+ * Reserve upper 4MB of PSRAM for KV cache, leaving lower 4MB for heap. */
+#define PSRAM_CACHE_ADDR      0x30400000                  /* Upper 4MB of 8MB PSRAM */
+#define PSRAM_CACHE_END       0x30800000                  /* End of 8MB PSRAM */
+static uint8_t* psram_cache_ptr = (uint8_t*)PSRAM_CACHE_ADDR;
+
+/* Bump allocator for PSRAM KV cache region */
+static void* psram_cache_alloc(size_t size) {
+    /* Align to 8 bytes */
+    size = (size + 7) & ~7;
+    if (psram_cache_ptr + size > (uint8_t*)PSRAM_CACHE_END) {
+        return NULL;  /* Fall back to SDRAM if PSRAM cache region full */
+    }
+    void* ptr = psram_cache_ptr;
+    psram_cache_ptr += size;
+    return ptr;
+}
+
 /* Configuration - adjust these for your model */
 #define DEFAULT_STEPS       64      /* Max tokens to generate */
 #define DEFAULT_TEMPERATURE 1.0f    /* Sampling temperature */
@@ -139,20 +158,38 @@ static void malloc_run_state(RunState* s, Config* p) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     int kv_cache_size = p->n_layers * p->seq_len * kv_dim * sizeof(float);
 
+    /* Activations go in SDRAM (sequential access pattern, less critical) */
     s->x = sdram_alloc(p->dim * sizeof(float));
     s->xb = sdram_alloc(p->dim * sizeof(float));
     s->xb2 = sdram_alloc(p->dim * sizeof(float));
     s->hb = sdram_alloc(p->hidden_dim * sizeof(float));
     s->hb2 = sdram_alloc(p->hidden_dim * sizeof(float));
     s->q = sdram_alloc(p->dim * sizeof(float));
+
+    /* KV cache - try PSRAM first for faster random access, fall back to SDRAM.
+     * NOTE: PSRAM seems to cause hangs during inference, using SDRAM for now. */
+    #if 0  /* Disabled - PSRAM causes hangs */
+    s->key_cache = psram_cache_alloc(kv_cache_size);
+    s->value_cache = psram_cache_alloc(kv_cache_size);
+    if (!s->key_cache || !s->value_cache) {
+        printf("PSRAM cache full, using SDRAM for KV cache\n");
+        s->key_cache = sdram_alloc(kv_cache_size);
+        s->value_cache = sdram_alloc(kv_cache_size);
+    } else {
+        printf("KV cache in fast PSRAM (%d KB x2)\n", kv_cache_size / 1024);
+    }
+    #else
     s->key_cache = sdram_alloc(kv_cache_size);
     s->value_cache = sdram_alloc(kv_cache_size);
+    printf("KV cache in SDRAM (%d KB x2)\n", kv_cache_size / 1024);
+    #endif
+
     s->att = sdram_alloc(p->n_heads * p->seq_len * sizeof(float));
     s->logits = sdram_alloc(p->vocab_size * sizeof(float));
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
-        printf("ERROR: sdram_alloc failed!\n");
+        printf("ERROR: memory allocation failed!\n");
         while(1);
     }
 }
@@ -255,10 +292,21 @@ static void softmax(float* x, int size) {
 }
 
 static void matmul(float* xout, float* x, float* w, int n, int d) {
+    /* 4x loop unrolling for better performance */
     for (int i = 0; i < d; i++) {
         float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
+        float* wi = w + i * n;
+        int j = 0;
+        /* Process 4 elements at a time */
+        for (; j + 3 < n; j += 4) {
+            val += wi[j] * x[j];
+            val += wi[j+1] * x[j+1];
+            val += wi[j+2] * x[j+2];
+            val += wi[j+3] * x[j+3];
+        }
+        /* Handle remaining elements */
+        for (; j < n; j++) {
+            val += wi[j] * x[j];
         }
         xout[i] = val;
     }
@@ -343,6 +391,7 @@ static float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
+        /* SwiGLU activation: silu(x) * gate, where silu(x) = x * sigmoid(x) */
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
             val *= (1.0f / (1.0f + expf(-val)));
@@ -878,8 +927,7 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
 #define MODEL_SDRAM_ADDR      0x10000000                  /* Slot 0: bridge 0x00000000 */
 #define TOKENIZER_SDRAM_ADDR  0x13F00000                  /* Slot 1: bridge 0x03F00000 */
 #define HEAP_PSRAM_ADDR       0x30000000                  /* Heap in PSRAM (CRAM0) */
-#define PSRAM_END             0x31000000                  /* End of 16MB PSRAM */
-#define HEAP_SIZE             (PSRAM_END - HEAP_PSRAM_ADDR)  /* 16MB for heap */
+#define HEAP_SIZE             (PSRAM_CACHE_ADDR - HEAP_PSRAM_ADDR)  /* 8MB for heap, upper 8MB for KV cache */
 
 void llama_main(void) {
     printf("llama2.c for Analogue Pocket\n\n");
