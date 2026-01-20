@@ -344,6 +344,25 @@ double tan(double x) {
 }
 
 /* ============================================
+ * Hyperbolic functions
+ * tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+ * ============================================ */
+
+float tanhf(float x) {
+    /* For large |x|, tanh approaches +/-1 */
+    if (x > 10.0f) return 1.0f;
+    if (x < -10.0f) return -1.0f;
+
+    /* Use identity: tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) */
+    float e2x = expf(2.0f * x);
+    return (e2x - 1.0f) / (e2x + 1.0f);
+}
+
+double tanh(double x) {
+    return (double)tanhf((float)x);
+}
+
+/* ============================================
  * Floor and ceiling functions
  * ============================================ */
 

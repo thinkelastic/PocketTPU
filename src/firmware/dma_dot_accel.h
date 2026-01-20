@@ -19,6 +19,7 @@
 #define DMA_DOT_RESULT_HI (DMA_DOT_ACCEL_BASE + 0x0C)
 #define DMA_DOT_ADDR_A    (DMA_DOT_ACCEL_BASE + 0x10)
 #define DMA_DOT_ADDR_B    (DMA_DOT_ACCEL_BASE + 0x14)
+#define DMA_DOT_ADDR_A_NEXT (DMA_DOT_ACCEL_BASE + 0x18)
 
 // Maximum vector size per batch (increased to 512 for B-caching optimization)
 #define DMA_DOT_MAX_LEN   512
@@ -58,6 +59,11 @@ static inline void dma_dot_wait(void) {
 #define DMA_DOT_CTRL_START       (1 << 0)  // Start operation
 #define DMA_DOT_CTRL_USE_CACHED  (1 << 1)  // Use cached B vector
 #define DMA_DOT_CTRL_PRELOAD_B   (1 << 2)  // Preload B only, no compute
+#define DMA_DOT_CTRL_PIPELINE    (1 << 3)  // Pipeline mode: prefetch next A while computing
+
+// Status register bits (read from CTRL)
+#define DMA_DOT_STATUS_BUSY      (1 << 0)  // Accelerator is busy
+#define DMA_DOT_STATUS_READY     (1 << 4)  // Ready for next operation (prefetch done)
 
 // Start accelerator computation (normal mode)
 static inline void dma_dot_start(void) {
@@ -167,6 +173,63 @@ static inline int64_t dma_dot_product_q16_cached(int32_t* a, int n) {
     dma_dot_set_addr_a(ptr_to_sdram_word_addr(a));
     dma_dot_set_length(n);
     dma_dot_start_cached();
+    dma_dot_wait();
+    return dma_dot_get_result();
+}
+
+/*
+ * ============================================================================
+ * PIPELINED DOUBLE-BUFFERING API
+ * ============================================================================
+ * For maximum throughput, use the pipelined API which overlaps DMA with compute:
+ *
+ * 1. dma_dot_preload_b_vector(x, n)     - Preload x vector once
+ * 2. dma_dot_pipeline_first(w0, w1, n)  - Start first row, prefetch second
+ * 3. Loop: result = dma_dot_pipeline_next(w_next, n) - Get result, start next
+ * 4. result = dma_dot_pipeline_last(n)  - Get final result
+ */
+
+// Set next A address for prefetching
+static inline void dma_dot_set_addr_a_next(uint32_t word_addr) {
+    REG32(DMA_DOT_ADDR_A_NEXT) = word_addr;
+}
+
+// Start pipelined computation: fetch A, compute with cached B, prefetch next A
+static inline void dma_dot_start_pipeline(void) {
+    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_USE_CACHED | DMA_DOT_CTRL_PIPELINE;
+}
+
+/*
+ * Start first pipelined dot product.
+ * Fetches first A, starts compute, prefetches second A.
+ */
+static inline void dma_dot_pipeline_first(int32_t* a_first, int32_t* a_next, int n) {
+    dma_dot_set_addr_a(ptr_to_sdram_word_addr(a_first));
+    dma_dot_set_addr_a_next(ptr_to_sdram_word_addr(a_next));
+    dma_dot_set_length(n);
+    dma_dot_start_pipeline();
+}
+
+/*
+ * Continue pipelined operation: wait for previous, get result, start next.
+ * The next A was already prefetched, so this just starts compute and prefetches a_next.
+ */
+static inline int64_t dma_dot_pipeline_next(int32_t* a_next, int n) {
+    dma_dot_wait();
+    int64_t result = dma_dot_get_result();
+
+    // Set up next prefetch and start
+    dma_dot_set_addr_a_next(ptr_to_sdram_word_addr(a_next));
+    dma_dot_start_pipeline();
+
+    return result;
+}
+
+/*
+ * Finish pipelined operation: wait for last compute, get result.
+ * No more prefetching needed.
+ */
+static inline int64_t dma_dot_pipeline_last(void) {
     dma_dot_wait();
     return dma_dot_get_result();
 }

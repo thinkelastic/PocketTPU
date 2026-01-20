@@ -14,6 +14,7 @@
 #include "dataslot.h"
 #include "terminal.h"
 #include "tokenizer_data.h"  /* Embedded tokenizer workaround */
+#include "gguf.h"            /* GGUF format parser */
 
 /* Redirect printf to terminal */
 #define printf term_printf
@@ -36,10 +37,10 @@ static void* sdram_alloc(size_t size) {
 }
 
 /* Fast PSRAM arena for KV cache - PSRAM is ~3-5x faster than SDRAM for random access.
- * PSRAM is 8MB total (only CRAM0 is connected, CRAM1 is tied off).
- * Reserve upper 4MB of PSRAM for KV cache, leaving lower 4MB for heap. */
-#define PSRAM_CACHE_ADDR      0x30400000                  /* Upper 4MB of 8MB PSRAM */
-#define PSRAM_CACHE_END       0x30800000                  /* End of 8MB PSRAM */
+ * PSRAM is 16MB total (CRAM0 + CRAM1).
+ * Reserve upper 8MB of PSRAM for KV cache, leaving lower 8MB for heap. */
+#define PSRAM_CACHE_ADDR      0x30800000                  /* Upper 8MB of 16MB PSRAM */
+#define PSRAM_CACHE_END       0x31000000                  /* End of 16MB PSRAM */
 static uint8_t* psram_cache_ptr = (uint8_t*)PSRAM_CACHE_ADDR;
 
 /* Bump allocator for PSRAM KV cache region */
@@ -55,14 +56,21 @@ static void* psram_cache_alloc(size_t size) {
 }
 
 /* Configuration - adjust these for your model */
-#define DEFAULT_STEPS       64      /* Max tokens to generate */
-#define DEFAULT_TEMPERATURE 1.0f    /* Sampling temperature */
-#define DEFAULT_TOPP        0.9f
+#define DEFAULT_STEPS       1024     /* Max tokens to generate */
+#define DEFAULT_TEMPERATURE 0.0f    /* 0 = greedy sampling (deterministic) */
+#define DEFAULT_TOPP        1.0f    /* 1 = disabled */
 #define DEFAULT_PROMPT      "Once upon a time"
 
 /* ============================================
  * Transformer model structures
  * ============================================ */
+
+/* Architecture types */
+#define ARCH_LLAMA 1
+#define ARCH_GPT2  2
+
+/* Maximum layers supported for per-layer direct GGUF access */
+#define MAX_LAYERS 32
 
 typedef struct {
     int dim;         /* Transformer dimension */
@@ -72,21 +80,47 @@ typedef struct {
     int n_kv_heads;  /* Number of KV heads (can be < n_heads for MQA) */
     int vocab_size;  /* Vocabulary size */
     int seq_len;     /* Max sequence length */
+    int arch;        /* Architecture type: ARCH_LLAMA or ARCH_GPT2 */
 } Config;
 
 typedef struct {
+    /* Common weights */
     float* token_embedding_table;
+    float* wcls;                    /* Output projection */
+
+    /* LLaMA weights (RMSNorm, SwiGLU) */
     float* rms_att_weight;
     float* rms_ffn_weight;
+    float* rms_final_weight;
     float* wq;
     float* wk;
     float* wv;
     float* wo;
-    float* w1;
-    float* w2;
-    float* w3;
-    float* rms_final_weight;
-    float* wcls;
+    float* w1;                      /* FFN gate (SwiGLU) */
+    float* w2;                      /* FFN down */
+    float* w3;                      /* FFN up (SwiGLU) */
+
+    /* GPT-2 specific weights (LayerNorm with bias, GELU FFN) */
+    float* position_embedding;      /* Learned position embeddings [seq_len, dim] */
+    float* ln_att_weight;           /* LayerNorm attention weight */
+    float* ln_att_bias;             /* LayerNorm attention bias */
+    float* ln_ffn_weight;           /* LayerNorm FFN weight */
+    float* ln_ffn_bias;             /* LayerNorm FFN bias */
+    float* ln_final_weight;         /* Final LayerNorm weight */
+    float* ln_final_bias;           /* Final LayerNorm bias */
+    float* wqkv;                    /* Fused QKV projection [3*dim, dim] (contiguous) */
+    float* wqkv_bias;               /* Fused QKV bias [3*dim] */
+    float* wo_bias;                 /* Output projection bias [dim] */
+    float* ffn_up_weight;           /* FFN up projection (GELU) (contiguous) */
+    float* ffn_up_bias;
+    float* ffn_down_weight;         /* FFN down projection (contiguous) */
+    float* ffn_down_bias;
+
+    /* Per-layer direct GGUF pointers (NULL if using contiguous arrays above) */
+    float* wqkv_layer[MAX_LAYERS];       /* Per-layer QKV weights */
+    float* wo_layer[MAX_LAYERS];         /* Per-layer output projection */
+    float* ffn_up_layer[MAX_LAYERS];     /* Per-layer FFN up */
+    float* ffn_down_layer[MAX_LAYERS];   /* Per-layer FFN down */
 } TransformerWeights;
 
 typedef struct {
@@ -155,13 +189,21 @@ typedef struct {
  * ============================================ */
 
 static void malloc_run_state(RunState* s, Config* p) {
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    /* KV cache dimension: LLaMA uses kv_dim (MQA/GQA), GPT-2 uses full dim */
+    int kv_dim;
+    if (p->arch == ARCH_GPT2) {
+        kv_dim = p->dim;  /* GPT-2: full dimension for KV */
+    } else {
+        kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;  /* LLaMA: MQA/GQA */
+    }
     int kv_cache_size = p->n_layers * p->seq_len * kv_dim * sizeof(float);
 
     /* Activations go in SDRAM (sequential access pattern, less critical) */
     s->x = sdram_alloc(p->dim * sizeof(float));
     s->xb = sdram_alloc(p->dim * sizeof(float));
-    s->xb2 = sdram_alloc(p->dim * sizeof(float));
+    /* xb2 needs to be larger for GPT-2 fused QKV (3*dim output) */
+    int xb2_size = (p->arch == ARCH_GPT2) ? 3 * p->dim : p->dim;
+    s->xb2 = sdram_alloc(xb2_size * sizeof(float));
     s->hb = sdram_alloc(p->hidden_dim * sizeof(float));
     s->hb2 = sdram_alloc(p->hidden_dim * sizeof(float));
     s->q = sdram_alloc(p->dim * sizeof(float));
@@ -233,12 +275,29 @@ static void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int
 static void build_transformer_from_memory(Transformer *t, void* data, size_t size) {
     Config* config = (Config*)data;
     t->config = *config;
+    t->config.arch = ARCH_LLAMA;  /* model.bin format is always LLaMA */
 
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     t->config.vocab_size = abs(config->vocab_size);
 
     float* weights_ptr = (float*)((char*)data + sizeof(Config));
     memory_map_weights(&t->weights, &t->config, weights_ptr, shared_weights);
+
+    /* For shared weights with DMA acceleration, we need a COPY of token_embedding_table
+     * for wcls because:
+     * - token_embedding_table must stay as float for token lookups
+     * - wcls must be converted to Q16.16 for DMA matmul
+     */
+    if (shared_weights && t->weights.wcls == t->weights.token_embedding_table) {
+        size_t wcls_size = (size_t)t->config.vocab_size * t->config.dim * sizeof(float);
+        float* wcls_copy = sdram_alloc(wcls_size);
+        if (wcls_copy) {
+            memcpy(wcls_copy, t->weights.token_embedding_table, wcls_size);
+            t->weights.wcls = wcls_copy;
+            printf("  Copied embeddings for wcls (shared weights)\n");
+        }
+    }
+
     malloc_run_state(&t->state, &t->config);
 
     t->data = data;
@@ -265,6 +324,41 @@ static void rmsnorm(float* o, float* x, float* weight, int size) {
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
     }
+}
+
+/* LayerNorm with bias (for GPT-2) */
+static void layernorm(float* o, float* x, float* weight, float* bias, int size) {
+    /* Calculate mean */
+    float mean = 0.0f;
+    for (int j = 0; j < size; j++) {
+        mean += x[j];
+    }
+    mean /= size;
+
+    /* Calculate variance */
+    float var = 0.0f;
+    for (int j = 0; j < size; j++) {
+        float diff = x[j] - mean;
+        var += diff * diff;
+    }
+    var /= size;
+
+    /* Normalize and scale */
+    float inv_std = 1.0f / sqrtf(var + 1e-5f);
+    for (int j = 0; j < size; j++) {
+        o[j] = weight[j] * ((x[j] - mean) * inv_std) + bias[j];
+    }
+}
+
+/* GELU activation (for GPT-2) - approximation using tanh */
+static float gelu(float x) {
+    /* GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
+    float x3 = x * x * x;
+    float tanh_arg = 0.7978845608f * (x + 0.044715f * x3);
+    /* tanh approximation using exp */
+    float exp2x = expf(2.0f * tanh_arg);
+    float tanh_val = (exp2x - 1.0f) / (exp2x + 1.0f);
+    return 0.5f * x * (1.0f + tanh_val);
 }
 
 static void softmax(float* x, int size) {
@@ -306,14 +400,69 @@ static void convert_weights_to_q16(float* weights, size_t num_floats) {
  * DMA can only read from SDRAM, so we copy x here before each matmul */
 static int32_t* x_sdram_buf = NULL;
 
+/* SDRAM buffer for attention K vectors - copied from PSRAM for DMA access
+ * Batch size chosen to balance copy overhead vs DMA efficiency */
+#define ATTN_BATCH_SIZE 16
+static int32_t* k_sdram_batch = NULL;
+
+/* Minimum head_size to use DMA acceleration
+ * For very small vectors, DMA overhead exceeds the benefit */
+#define MIN_HEAD_SIZE_FOR_DMA 32
+
+/* Accelerated attention score computation using DMA dot product
+ * Copies K vectors from PSRAM to SDRAM in batches, then uses hardware accelerator */
+static void accel_attention_scores(float* att, float* q, float* key_cache,
+                                   int pos, int head_size, int kv_dim, int kv_head_offset) {
+    float scale = 1.0f / sqrtf((float)head_size);
+
+    /* For small head_size, DMA overhead exceeds benefit - use software */
+    if (head_size < MIN_HEAD_SIZE_FOR_DMA) {
+        for (int t = 0; t <= pos; t++) {
+            float* k = key_cache + t * kv_dim + kv_head_offset;
+            float score = 0.0f;
+            for (int i = 0; i < head_size; i++) {
+                score += q[i] * k[i];
+            }
+            att[t] = score * scale;
+        }
+        return;
+    }
+
+    /* Convert Q to Q16.16 and preload into accelerator's B-cache */
+    for (int i = 0; i < head_size; i++) {
+        x_sdram_buf[i] = FLOAT_TO_Q16(q[i]);
+    }
+    dma_dot_preload_b_vector(x_sdram_buf, head_size);
+
+    /* Process K vectors in batches */
+    for (int t = 0; t <= pos; t += ATTN_BATCH_SIZE) {
+        int batch_end = (t + ATTN_BATCH_SIZE <= pos + 1) ? t + ATTN_BATCH_SIZE : pos + 1;
+        int batch_size = batch_end - t;
+
+        /* Copy batch of K vectors from PSRAM to SDRAM buffer */
+        for (int b = 0; b < batch_size; b++) {
+            float* k = key_cache + (t + b) * kv_dim + kv_head_offset;
+            int32_t* k_dst = k_sdram_batch + b * head_size;
+            for (int i = 0; i < head_size; i++) {
+                k_dst[i] = FLOAT_TO_Q16(k[i]);
+            }
+        }
+
+        /* Compute dot products using DMA with cached B (Q vector) */
+        for (int b = 0; b < batch_size; b++) {
+            int32_t* k_q16 = k_sdram_batch + b * head_size;
+            int64_t result = dma_dot_product_q16_cached(k_q16, head_size);
+            att[t + b] = Q32_TO_FLOAT(result) * scale;
+        }
+    }
+}
+
 static void matmul(float* xout, float* x, float* w, int n, int d) {
     /* W (d,n) @ x (n,) -> xout (d,)
      * Weights are pre-converted to Q16.16 and stored in SDRAM.
      * x is converted to Q16.16 and copied to SDRAM buffer for DMA.
      *
-     * Optimization: Use B-caching when n <= 256 (single batch).
-     * Preload x vector once, then use cached B for all d rows.
-     * This halves DMA bandwidth since x is only fetched once.
+     * B-caching optimization: Preload x vector once, reuse for all rows.
      */
     int32_t* w_q16 = (int32_t*)w;
 
@@ -323,11 +472,8 @@ static void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 
     if (n <= DMA_DOT_MAX_LEN) {
-        /* Single batch - use B-caching optimization */
-        /* Preload x vector (stored as B in hardware) once */
+        /* Use B-caching - preload x once, reuse for all rows */
         dma_dot_preload_b_vector(x_sdram_buf, n);
-
-        /* Compute each output element using cached B */
         for (int i = 0; i < d; i++) {
             int32_t* wi = w_q16 + i * n;
             int64_t result = dma_dot_product_q16_cached(wi, n);
@@ -358,7 +504,8 @@ static void matmul(float* xout, float* x, float* w, int n, int d) {
 }
 #endif
 
-static float* forward(Transformer* transformer, int token, int pos) {
+/* LLaMA forward pass (RMSNorm, RoPE, SwiGLU) */
+static float* forward_llama(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
@@ -403,8 +550,15 @@ static float* forward(Transformer* transformer, int token, int pos) {
         for (int h = 0; h < p->n_heads; h++) {
             float* q = s->q + h * head_size;
             float* att = s->att + h * p->seq_len;
+            int kv_head_offset = (h / kv_mul) * head_size;
+
+#if USE_DMA_ACCEL
+            /* Use hardware accelerator for Q·K dot products */
+            accel_attention_scores(att, q, s->key_cache + loff, pos,
+                                   head_size, kv_dim, kv_head_offset);
+#else
             for (int t = 0; t <= pos; t++) {
-                float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                float* k = s->key_cache + loff + t * kv_dim + kv_head_offset;
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) {
                     score += q[i] * k[i];
@@ -412,6 +566,7 @@ static float* forward(Transformer* transformer, int token, int pos) {
                 score /= sqrtf(head_size);
                 att[t] = score;
             }
+#endif
 
             softmax(att, pos + 1);
 
@@ -455,6 +610,134 @@ static float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
     return s->logits;
+}
+
+/* GPT-2 forward pass (LayerNorm, learned pos emb, GELU) */
+static float* forward_gpt2(Transformer* transformer, int token, int pos) {
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    float *x = s->x;
+    int dim = p->dim;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+    int n_heads = p->n_heads;
+
+    /* Token embedding + position embedding */
+    float* tok_emb = w->token_embedding_table + token * dim;
+    float* pos_emb = w->position_embedding + pos * dim;
+    for (int i = 0; i < dim; i++) {
+        x[i] = tok_emb[i] + pos_emb[i];
+    }
+
+    for (int l = 0; l < p->n_layers; l++) {
+        /* Pre-attention LayerNorm */
+        layernorm(s->xb, x, w->ln_att_weight + l*dim, w->ln_att_bias + l*dim, dim);
+
+        /* Fused QKV projection: [dim] -> [3*dim] */
+        /* Output: s->q[0..dim-1], s->k[0..dim-1], s->v[0..dim-1] stored in s->xb2 */
+        /* Use per-layer pointer if available, otherwise contiguous array */
+        float* wqkv_l = w->wqkv_layer[l] ? w->wqkv_layer[l] : (w->wqkv + l*dim*3*dim);
+        matmul(s->xb2, s->xb, wqkv_l, dim, 3*dim);
+        /* Add bias */
+        for (int i = 0; i < 3*dim; i++) {
+            s->xb2[i] += w->wqkv_bias[l*3*dim + i];
+        }
+
+        /* Split Q, K, V and store K, V in cache */
+        int loff = l * p->seq_len * dim;
+        float* q_out = s->q;
+        float* k_cache_pos = s->key_cache + loff + pos * dim;
+        float* v_cache_pos = s->value_cache + loff + pos * dim;
+        for (int i = 0; i < dim; i++) {
+            q_out[i] = s->xb2[i];
+            k_cache_pos[i] = s->xb2[dim + i];
+            v_cache_pos[i] = s->xb2[2*dim + i];
+        }
+
+        /* Multi-head attention (no RoPE - GPT-2 uses learned positions) */
+        for (int h = 0; h < n_heads; h++) {
+            float* q = s->q + h * head_size;
+            float* att = s->att + h * p->seq_len;
+
+            /* Compute attention scores: Q @ K^T / sqrt(head_size) */
+            float scale = 1.0f / sqrtf((float)head_size);
+            for (int t = 0; t <= pos; t++) {
+                float* k = s->key_cache + loff + t * dim + h * head_size;
+                float score = 0.0f;
+                for (int i = 0; i < head_size; i++) {
+                    score += q[i] * k[i];
+                }
+                att[t] = score * scale;
+            }
+
+            softmax(att, pos + 1);
+
+            /* Weighted sum of values */
+            float* xb = s->xb + h * head_size;
+            memset(xb, 0, head_size * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                float* v = s->value_cache + loff + t * dim + h * head_size;
+                float a = att[t];
+                for (int i = 0; i < head_size; i++) {
+                    xb[i] += a * v[i];
+                }
+            }
+        }
+
+        /* Output projection */
+        float* wo_l = w->wo_layer[l] ? w->wo_layer[l] : (w->wo + l*dim*dim);
+        matmul(s->xb2, s->xb, wo_l, dim, dim);
+        /* Add bias */
+        for (int i = 0; i < dim; i++) {
+            s->xb2[i] += w->wo_bias[l*dim + i];
+        }
+
+        /* Residual connection */
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
+
+        /* Pre-FFN LayerNorm */
+        layernorm(s->xb, x, w->ln_ffn_weight + l*dim, w->ln_ffn_bias + l*dim, dim);
+
+        /* FFN: up projection -> GELU -> down projection */
+        float* ffn_up_l = w->ffn_up_layer[l] ? w->ffn_up_layer[l] : (w->ffn_up_weight + l*dim*hidden_dim);
+        matmul(s->hb, s->xb, ffn_up_l, dim, hidden_dim);
+        /* Add bias and apply GELU */
+        for (int i = 0; i < hidden_dim; i++) {
+            s->hb[i] = gelu(s->hb[i] + w->ffn_up_bias[l*hidden_dim + i]);
+        }
+
+        /* Down projection */
+        float* ffn_down_l = w->ffn_down_layer[l] ? w->ffn_down_layer[l] : (w->ffn_down_weight + l*hidden_dim*dim);
+        matmul(s->xb, s->hb, ffn_down_l, hidden_dim, dim);
+        /* Add bias */
+        for (int i = 0; i < dim; i++) {
+            s->xb[i] += w->ffn_down_bias[l*dim + i];
+        }
+
+        /* Residual connection */
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
+    }
+
+    /* Final LayerNorm */
+    layernorm(x, x, w->ln_final_weight, w->ln_final_bias, dim);
+
+    /* Output projection (logits) */
+    matmul(s->logits, x, w->wcls, dim, p->vocab_size);
+    return s->logits;
+}
+
+/* Dispatch to appropriate forward pass based on architecture */
+static float* forward(Transformer* transformer, int token, int pos) {
+    if (transformer->config.arch == ARCH_GPT2) {
+        return forward_gpt2(transformer, token, pos);
+    } else {
+        return forward_llama(transformer, token, pos);
+    }
 }
 
 /* ============================================
@@ -863,7 +1146,16 @@ static void build_sampler(Sampler* sampler, int vocab_size, float temperature, f
     sampler->temperature = temperature;
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    /* Only allocate probindex if using top-p sampling */
+    if (temperature > 0.0f && topp > 0.0f && topp < 1.0f) {
+        sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+        if (!sampler->probindex) {
+            printf("WARNING: probindex malloc failed, using greedy sampling\n");
+            sampler->temperature = 0.0f;  /* Force greedy sampling */
+        }
+    } else {
+        sampler->probindex = NULL;
+    }
 }
 
 static void free_sampler(Sampler* sampler) {
@@ -966,15 +1258,577 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
 }
 
 /* ============================================
+ * GGUF Model Loading
+ * ============================================ */
+
+/* Global GGUF context for tokenizer access */
+static GGUFContext g_gguf_ctx;
+
+/* Read float from potentially unaligned SDRAM address using word-aligned reads */
+static inline float read_float_aligned(const uint8_t* ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t aligned = addr & ~3;
+    int offset = addr & 3;
+
+    uint32_t w0 = *(const volatile uint32_t*)aligned;
+    if (offset == 0) {
+        float f;
+        memcpy(&f, &w0, sizeof(float));
+        return f;
+    }
+
+    uint32_t w1 = *(const volatile uint32_t*)(aligned + 4);
+    uint32_t bits = (w0 >> (offset * 8)) | (w1 << ((4 - offset) * 8));
+    float f;
+    memcpy(&f, &bits, sizeof(float));
+    return f;
+}
+
+/* Get direct pointer to F32 tensor data in GGUF (no copy needed if aligned)
+ * Returns pointer to tensor data if F32, or NULL if conversion needed */
+static float* get_tensor_direct(GGUFContext* ctx, const char* name, GGUFTensorInfo* out_info) {
+    if (gguf_find_tensor(ctx, name, out_info) != 0) {
+        return NULL;  /* Not found */
+    }
+
+    /* Only return direct pointer for F32 tensors that are 4-byte aligned */
+    if (out_info->type == GGML_TYPE_F32) {
+        const uint8_t* ptr = gguf_get_tensor_data(ctx, out_info);
+        if (((uintptr_t)ptr & 3) == 0) {
+            return (float*)ptr;  /* Aligned F32 - can use directly */
+        }
+    }
+
+    return NULL;  /* Need conversion/copy */
+}
+
+/* Load tensor data directly into destination buffer (no transpose needed) */
+static int load_tensor_to_buffer(GGUFContext* ctx, const char* name, float* dest, int count) {
+    GGUFTensorInfo info;
+    if (gguf_find_tensor(ctx, name, &info) != 0) {
+        return -1;  /* Not found */
+    }
+
+    const uint8_t* src = gguf_get_tensor_data(ctx, &info);
+
+    if (info.type == GGML_TYPE_F32) {
+        /* Use aligned reads for SDRAM access */
+        for (int i = 0; i < count; i++) {
+            dest[i] = read_float_aligned(src + i * 4);
+        }
+    } else if (info.type == GGML_TYPE_F16) {
+        /* FP16: read 2 bytes at a time with alignment handling */
+        for (int i = 0; i < count; i++) {
+            uintptr_t addr = (uintptr_t)(src + i * 2);
+            uintptr_t aligned = addr & ~3;
+            int offset = addr & 3;
+            uint32_t word = *(const volatile uint32_t*)aligned;
+            uint16_t h;
+            if (offset <= 2) {
+                h = (word >> (offset * 8)) & 0xFFFF;
+            } else {
+                uint32_t w1 = *(const volatile uint32_t*)(aligned + 4);
+                h = ((word >> 24) | (w1 << 8)) & 0xFFFF;
+            }
+            dest[i] = fp16_to_float(h);
+        }
+    } else {
+        return -2;  /* Unsupported type */
+    }
+
+    return 0;
+}
+
+/* Try to get direct pointer, fall back to allocating and copying */
+static float* get_or_load_tensor(GGUFContext* ctx, const char* name, int count, const char* desc) {
+    GGUFTensorInfo info;
+    float* ptr = get_tensor_direct(ctx, name, &info);
+    if (ptr) {
+        return ptr;
+    }
+
+    /* Need to allocate and convert */
+    ptr = sdram_alloc(count * sizeof(float));
+    if (!ptr) {
+        printf("FAILED: %s alloc\n", desc);
+        return NULL;
+    }
+    if (load_tensor_to_buffer(ctx, name, ptr, count) != 0) {
+        printf("FAILED: %s load\n", desc);
+        return NULL;
+    }
+    return ptr;
+}
+
+/* Build LLaMA transformer from GGUF file */
+static int build_llama_from_gguf(Transformer* t, GGUFContext* ctx) {
+    int dim = t->config.dim;
+    int n_layers = t->config.n_layers;
+    int hidden_dim = t->config.hidden_dim;
+    int vocab_size = t->config.vocab_size;
+    int kv_dim = (dim * t->config.n_kv_heads) / t->config.n_heads;
+
+    /* Token embeddings */
+    t->weights.token_embedding_table = sdram_alloc((size_t)vocab_size * dim * sizeof(float));
+    if (!t->weights.token_embedding_table) return -1;
+    load_tensor_to_buffer(ctx, "token_embd.weight", t->weights.token_embedding_table, vocab_size * dim);
+    printf("  Loaded embeddings [%d x %d]\n", vocab_size, dim);
+
+    /* RMSNorm weights - allocate contiguously for all layers */
+    t->weights.rms_att_weight = sdram_alloc(n_layers * dim * sizeof(float));
+    t->weights.rms_ffn_weight = sdram_alloc(n_layers * dim * sizeof(float));
+
+    /* Attention weights */
+    t->weights.wq = sdram_alloc(n_layers * dim * dim * sizeof(float));
+    t->weights.wk = sdram_alloc(n_layers * kv_dim * dim * sizeof(float));
+    t->weights.wv = sdram_alloc(n_layers * kv_dim * dim * sizeof(float));
+    t->weights.wo = sdram_alloc(n_layers * dim * dim * sizeof(float));
+
+    /* FFN weights */
+    t->weights.w1 = sdram_alloc(n_layers * hidden_dim * dim * sizeof(float));
+    t->weights.w2 = sdram_alloc(n_layers * dim * hidden_dim * sizeof(float));
+    t->weights.w3 = sdram_alloc(n_layers * hidden_dim * dim * sizeof(float));
+
+    /* Load each layer's weights */
+    char tensor_name[64];
+    for (int l = 0; l < n_layers; l++) {
+        sprintf(tensor_name, "blk.%d.attn_norm.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.rms_att_weight + l * dim, dim);
+
+        sprintf(tensor_name, "blk.%d.attn_q.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.wq + l * dim * dim, dim * dim);
+        sprintf(tensor_name, "blk.%d.attn_k.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.wk + l * kv_dim * dim, kv_dim * dim);
+        sprintf(tensor_name, "blk.%d.attn_v.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.wv + l * kv_dim * dim, kv_dim * dim);
+
+        sprintf(tensor_name, "blk.%d.attn_output.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.wo + l * dim * dim, dim * dim);
+
+        sprintf(tensor_name, "blk.%d.ffn_norm.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.rms_ffn_weight + l * dim, dim);
+
+        sprintf(tensor_name, "blk.%d.ffn_gate.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.w1 + l * hidden_dim * dim, hidden_dim * dim);
+        sprintf(tensor_name, "blk.%d.ffn_down.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.w2 + l * dim * hidden_dim, dim * hidden_dim);
+        sprintf(tensor_name, "blk.%d.ffn_up.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.w3 + l * hidden_dim * dim, hidden_dim * dim);
+
+        if ((l + 1) % 2 == 0 || l == n_layers - 1) {
+            printf("  Loaded layer %d/%d\n", l + 1, n_layers);
+        }
+    }
+
+    /* Final RMSNorm */
+    t->weights.rms_final_weight = sdram_alloc(dim * sizeof(float));
+    load_tensor_to_buffer(ctx, "output_norm.weight", t->weights.rms_final_weight, dim);
+
+    /* Output projection */
+    GGUFTensorInfo wcls_info;
+    if (gguf_find_tensor(ctx, "output.weight", &wcls_info) == 0) {
+        t->weights.wcls = sdram_alloc((size_t)vocab_size * dim * sizeof(float));
+        load_tensor_to_buffer(ctx, "output.weight", t->weights.wcls, vocab_size * dim);
+        printf("  Loaded output projection\n");
+    } else {
+        t->weights.wcls = sdram_alloc((size_t)vocab_size * dim * sizeof(float));
+        if (!t->weights.wcls) return -1;
+        memcpy(t->weights.wcls, t->weights.token_embedding_table,
+               (size_t)vocab_size * dim * sizeof(float));
+        printf("  Copied embeddings for output (tied weights)\n");
+    }
+
+    return 0;
+}
+
+/* Build GPT-2 transformer from GGUF file */
+static int build_gpt2_from_gguf(Transformer* t, GGUFContext* ctx) {
+    int dim = t->config.dim;
+    int n_layers = t->config.n_layers;
+    int hidden_dim = t->config.hidden_dim;
+    int vocab_size = t->config.vocab_size;
+    int seq_len = t->config.seq_len;
+
+    printf("Loading GPT-2: dim=%d layers=%d vocab=%d\n", dim, n_layers, vocab_size);
+
+    /* Token embeddings - try direct pointer first */
+    t->weights.token_embedding_table = get_or_load_tensor(ctx, "token_embd.weight",
+                                                          vocab_size * dim, "token_embd");
+    if (!t->weights.token_embedding_table) return -1;
+
+    /* Position embeddings */
+    t->weights.position_embedding = get_or_load_tensor(ctx, "position_embd.weight",
+                                                       seq_len * dim, "position_embd");
+    if (!t->weights.position_embedding) return -1;
+
+    if (n_layers > MAX_LAYERS) {
+        printf("  FAILED: n_layers %d > MAX_LAYERS %d\n", n_layers, MAX_LAYERS);
+        return -1;
+    }
+
+    /* LayerNorm weights are small, always copy for simplicity */
+    t->weights.ln_att_weight = sdram_alloc(n_layers * dim * sizeof(float));
+    t->weights.ln_att_bias = sdram_alloc(n_layers * dim * sizeof(float));
+    t->weights.ln_ffn_weight = sdram_alloc(n_layers * dim * sizeof(float));
+    t->weights.ln_ffn_bias = sdram_alloc(n_layers * dim * sizeof(float));
+
+    if (!t->weights.ln_att_weight || !t->weights.ln_att_bias ||
+        !t->weights.ln_ffn_weight || !t->weights.ln_ffn_bias) {
+        printf("  FAILED: LayerNorm alloc\n");
+        return -1;
+    }
+
+    /* Large weight matrices - use per-layer direct GGUF pointers */
+    t->weights.wqkv = NULL;  /* Using per-layer access */
+    t->weights.wo = NULL;
+    t->weights.ffn_up_weight = NULL;
+    t->weights.ffn_down_weight = NULL;
+
+    /* Biases are small, allocate contiguous arrays */
+    t->weights.wqkv_bias = sdram_alloc(n_layers * 3 * dim * sizeof(float));
+    t->weights.wo_bias = sdram_alloc(n_layers * dim * sizeof(float));
+    t->weights.ffn_up_bias = sdram_alloc(n_layers * hidden_dim * sizeof(float));
+    t->weights.ffn_down_bias = sdram_alloc(n_layers * dim * sizeof(float));
+
+    if (!t->weights.wqkv_bias || !t->weights.wo_bias ||
+        !t->weights.ffn_up_bias || !t->weights.ffn_down_bias) {
+        printf("  FAILED: bias alloc\n");
+        return -1;
+    }
+
+    /* Load each layer's weights - use direct pointers for large weights */
+    char tensor_name[64];
+    for (int l = 0; l < n_layers; l++) {
+        /* LayerNorm (attention) - small, always copy */
+        sprintf(tensor_name, "blk.%d.attn_norm.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.ln_att_weight + l * dim, dim);
+        sprintf(tensor_name, "blk.%d.attn_norm.bias", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.ln_att_bias + l * dim, dim);
+
+        /* Large weight matrices - get direct pointers */
+        sprintf(tensor_name, "blk.%d.attn_qkv.weight", l);
+        t->weights.wqkv_layer[l] = get_or_load_tensor(ctx, tensor_name, dim * 3 * dim, tensor_name);
+        if (!t->weights.wqkv_layer[l]) return -1;
+
+        sprintf(tensor_name, "blk.%d.attn_qkv.bias", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.wqkv_bias + l * 3 * dim, 3 * dim);
+
+        sprintf(tensor_name, "blk.%d.attn_output.weight", l);
+        t->weights.wo_layer[l] = get_or_load_tensor(ctx, tensor_name, dim * dim, tensor_name);
+        if (!t->weights.wo_layer[l]) return -1;
+
+        sprintf(tensor_name, "blk.%d.attn_output.bias", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.wo_bias + l * dim, dim);
+
+        /* LayerNorm (FFN) */
+        sprintf(tensor_name, "blk.%d.ffn_norm.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.ln_ffn_weight + l * dim, dim);
+        sprintf(tensor_name, "blk.%d.ffn_norm.bias", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.ln_ffn_bias + l * dim, dim);
+
+        /* FFN weights - direct pointers */
+        sprintf(tensor_name, "blk.%d.ffn_up.weight", l);
+        t->weights.ffn_up_layer[l] = get_or_load_tensor(ctx, tensor_name, dim * hidden_dim, tensor_name);
+        if (!t->weights.ffn_up_layer[l]) return -1;
+
+        sprintf(tensor_name, "blk.%d.ffn_up.bias", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.ffn_up_bias + l * hidden_dim, hidden_dim);
+
+        sprintf(tensor_name, "blk.%d.ffn_down.weight", l);
+        t->weights.ffn_down_layer[l] = get_or_load_tensor(ctx, tensor_name, hidden_dim * dim, tensor_name);
+        if (!t->weights.ffn_down_layer[l]) return -1;
+
+        sprintf(tensor_name, "blk.%d.ffn_down.bias", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.ffn_down_bias + l * dim, dim);
+    }
+
+    /* Final LayerNorm - small, always copy */
+    t->weights.ln_final_weight = sdram_alloc(dim * sizeof(float));
+    t->weights.ln_final_bias = sdram_alloc(dim * sizeof(float));
+    if (!t->weights.ln_final_weight || !t->weights.ln_final_bias) {
+        printf("  FAILED: final LayerNorm alloc\n");
+        return -1;
+    }
+    load_tensor_to_buffer(ctx, "output_norm.weight", t->weights.ln_final_weight, dim);
+    load_tensor_to_buffer(ctx, "output_norm.bias", t->weights.ln_final_bias, dim);
+
+    /* Output projection (lm_head) - use tied weights to save memory
+     * GPT-2 models typically share token embeddings with output projection */
+    t->weights.wcls = t->weights.token_embedding_table;  /* Tied weights */
+    printf("  Using tied weights for output projection\n");
+
+    printf("  GPT-2 weights loaded (direct GGUF access for large tensors)\n");
+    return 0;
+}
+
+/* Build transformer from GGUF file */
+static int build_transformer_from_gguf(Transformer* t, GGUFContext* ctx) {
+    GGUFConfig* gc = &ctx->config;
+
+    /* Copy config */
+    t->config.dim = gc->dim;
+    t->config.hidden_dim = gc->hidden_dim;
+    t->config.n_layers = gc->n_layers;
+    t->config.n_heads = gc->n_heads;
+    t->config.n_kv_heads = gc->n_kv_heads;
+    t->config.vocab_size = gc->vocab_size;
+    t->config.seq_len = gc->seq_len;
+
+    /* Set architecture based on GGUF metadata */
+    if (gc->arch == GGUF_ARCH_GPT2) {
+        t->config.arch = ARCH_GPT2;
+        printf("Loading GPT-2 model from GGUF...\n");
+    } else {
+        t->config.arch = ARCH_LLAMA;
+        printf("Loading LLaMA model from GGUF...\n");
+    }
+
+    int ret;
+    if (t->config.arch == ARCH_GPT2) {
+        ret = build_gpt2_from_gguf(t, ctx);
+    } else {
+        ret = build_llama_from_gguf(t, ctx);
+    }
+
+    if (ret != 0) {
+        printf("ERROR: Failed to load model weights\n");
+        return ret;
+    }
+
+    /* Allocate run state */
+    malloc_run_state(&t->state, &t->config);
+
+    printf("Model loaded successfully!\n");
+    return 0;
+}
+
+/* GGUF-based tokenizer decode */
+static char* decode_gguf(int prev_token, int token) {
+    static char token_str[128];
+    static char decoded[128];
+    if (gguf_get_vocab_string(&g_gguf_ctx, token, token_str, sizeof(token_str)) < 0) {
+        return "(ERR)";
+    }
+
+    /* GPT-2 BPE uses special byte encoding:
+     * - Ġ (U+0120, UTF-8: 0xC4 0xA0) represents space
+     * - Ċ (U+010A, UTF-8: 0xC4 0x8A) represents newline
+     * Convert these back to normal characters */
+    int j = 0;
+    for (int i = 0; token_str[i] && j < (int)sizeof(decoded) - 1; i++) {
+        unsigned char c = (unsigned char)token_str[i];
+        if (c == 0xC4 && (unsigned char)token_str[i+1] == 0xA0) {
+            decoded[j++] = ' ';  /* Ġ -> space */
+            i++;
+        } else if (c == 0xC4 && (unsigned char)token_str[i+1] == 0x8A) {
+            decoded[j++] = '\n'; /* Ċ -> newline */
+            i++;
+        } else {
+            decoded[j++] = token_str[i];
+        }
+    }
+    decoded[j] = '\0';
+
+    /* Skip leading space after BOS */
+    if (prev_token == (int)g_gguf_ctx.config.bos_token_id && decoded[0] == ' ') {
+        return decoded + 1;
+    }
+    return decoded;
+}
+
+/* Search for token string in GGUF vocab */
+static int gguf_str_lookup(GGUFContext* ctx, const char* str) {
+    static char token_buf[64];
+    for (int i = 0; i < (int)ctx->config.vocab_size; i++) {
+        if (gguf_get_vocab_string(ctx, i, token_buf, sizeof(token_buf)) >= 0) {
+            if (strcmp(token_buf, str) == 0) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Get GGUF vocab score (approximate - use token index as proxy) */
+static float gguf_get_score(GGUFContext* ctx, int id) {
+    /* llama2c tokenizer stores tokens sorted by score, so higher index = lower score */
+    /* Return negative index as proxy for score */
+    (void)ctx;
+    return -(float)id;
+}
+
+/* GGUF-based encoder using vocabulary lookup */
+static void encode_gguf(GGUFContext* ctx, char* text, int bos, int* tokens, int* n_tokens) {
+    static char str_buffer[256];
+    *n_tokens = 0;
+
+    if (bos) {
+        tokens[(*n_tokens)++] = ctx->config.bos_token_id;
+    }
+
+    if (text == NULL || text[0] == '\0') return;
+
+    /* Add dummy prefix space (like llama2c does) */
+    int space_id = gguf_str_lookup(ctx, " ");
+    if (space_id != -1) {
+        tokens[(*n_tokens)++] = space_id;
+    }
+
+    /* Encode each character, falling back to byte tokens */
+    size_t str_len = 0;
+    for (char* c = text; *c != '\0'; c++) {
+        /* Handle UTF-8 continuation bytes */
+        if ((*c & 0xC0) != 0x80) {
+            str_len = 0;
+        }
+
+        str_buffer[str_len++] = *c;
+        str_buffer[str_len] = '\0';
+
+        if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) {
+            continue;
+        }
+
+        int id = gguf_str_lookup(ctx, str_buffer);
+
+        if (id != -1) {
+            tokens[(*n_tokens)++] = id;
+        } else {
+            /* Fallback to byte tokens */
+            for (size_t i = 0; i < str_len; i++) {
+                /* Look up byte token like "<0xNN>" or single character */
+                char byte_str[8];
+                sprintf(byte_str, "<0x%02X>", (unsigned char)str_buffer[i]);
+                int byte_id = gguf_str_lookup(ctx, byte_str);
+                if (byte_id != -1) {
+                    tokens[(*n_tokens)++] = byte_id;
+                } else {
+                    /* Try single character */
+                    char single[2] = {str_buffer[i], '\0'};
+                    byte_id = gguf_str_lookup(ctx, single);
+                    if (byte_id != -1) {
+                        tokens[(*n_tokens)++] = byte_id;
+                    } else {
+                        /* Last resort: use token ID based on ASCII offset */
+                        tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
+                    }
+                }
+            }
+        }
+        str_len = 0;
+    }
+
+    /* BPE merge pass */
+    while (1) {
+        float best_score = -1e10f;
+        int best_id = -1;
+        int best_idx = -1;
+
+        static char tok_a[64], tok_b[64];
+        for (int i = 0; i < (*n_tokens - 1); i++) {
+            if (gguf_get_vocab_string(ctx, tokens[i], tok_a, sizeof(tok_a)) < 0) continue;
+            if (gguf_get_vocab_string(ctx, tokens[i+1], tok_b, sizeof(tok_b)) < 0) continue;
+
+            sprintf(str_buffer, "%s%s", tok_a, tok_b);
+            int id = gguf_str_lookup(ctx, str_buffer);
+            if (id != -1) {
+                float score = gguf_get_score(ctx, id);
+                if (score > best_score) {
+                    best_score = score;
+                    best_id = id;
+                    best_idx = i;
+                }
+            }
+        }
+
+        if (best_idx == -1) break;
+
+        tokens[best_idx] = best_id;
+        for (int i = best_idx + 1; i < (*n_tokens - 1); i++) {
+            tokens[i] = tokens[i + 1];
+        }
+        (*n_tokens)--;
+    }
+}
+
+/* Generation loop for GGUF models */
+static void generate_gguf(Transformer *transformer, GGUFContext* ctx, Sampler *sampler, char *prompt, int steps) {
+    char *empty_prompt = "";
+    if (prompt == NULL) { prompt = empty_prompt; }
+
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = (int*)malloc((strlen(prompt)+128) * sizeof(int));
+    if (!prompt_tokens) {
+        printf("ERROR: malloc failed\n");
+        while(1);
+    }
+
+    /* Use BOS token only - tokenization is too slow on this hardware */
+    prompt_tokens[num_prompt_tokens++] = ctx->config.bos_token_id;
+
+    uint64_t start_cycles = 0;
+    int next;
+    int token = prompt_tokens[0];
+    int pos = 0;
+    int tokens_generated = 0;
+
+    /* Start output */
+    printf("\n> ");
+
+    while (pos < steps) {
+        float* logits = forward(transformer, token, pos);
+
+        if (pos < num_prompt_tokens - 1) {
+            next = prompt_tokens[pos + 1];
+        } else {
+            next = sample(sampler, logits);
+            tokens_generated++;
+        }
+        pos++;
+
+        /* Check for EOS */
+        if (next == (int)ctx->config.eos_token_id) { break; }
+
+        /* Validate token is in vocab range */
+        if (next < 0 || next >= (int)ctx->config.vocab_size) {
+            printf("\nERROR: invalid token %d\n", next);
+            break;
+        }
+
+        /* Decode and print token */
+        char* piece = decode_gguf(token, next);
+        printf("%s", piece);
+        token = next;
+
+        if (start_cycles == 0 && pos >= num_prompt_tokens) {
+            start_cycles = ((uint64_t)SYS_CYCLE_HI << 32) | SYS_CYCLE_LO;
+        }
+    }
+    printf("\n");
+
+    if (tokens_generated > 1 && start_cycles > 0) {
+        uint64_t end_cycles = ((uint64_t)SYS_CYCLE_HI << 32) | SYS_CYCLE_LO;
+        uint64_t elapsed_cycles = end_cycles - start_cycles;
+        uint32_t elapsed_ms = (uint32_t)(elapsed_cycles / 50000);
+        if (elapsed_ms > 0) {
+            uint32_t tok_per_min = (uint32_t)((uint64_t)tokens_generated * 60000 / elapsed_ms);
+            printf("Speed: %d tok/min (%d ms total)\n", tok_per_min, elapsed_ms);
+        }
+    }
+
+    free(prompt_tokens);
+}
+
+/* ============================================
  * Main entry point
  * ============================================ */
 
 /*
  * Memory Layout:
  *
- * SDRAM (64MB): Model and tokenizer loaded by APF
- * Bridge 0x00000000 -> CPU 0x10000000: Model weights (up to 63MB)
- * Bridge 0x03F00000 -> CPU 0x13F00000: Tokenizer (last 1MB)
+ * SDRAM (64MB): Model loaded by APF (single GGUF file or model.bin+tokenizer.bin)
+ * Bridge 0x00000000 -> CPU 0x10000000: Model/GGUF file
+ * Bridge 0x03F00000 -> CPU 0x13F00000: Tokenizer (only for model.bin format)
  *
  * PSRAM (CRAM0, 16MB): Heap for runtime allocations
  * CPU 0x30000000 - 0x30FFFFFF
@@ -985,7 +1839,7 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
 #define HEAP_SIZE             (PSRAM_CACHE_ADDR - HEAP_PSRAM_ADDR)  /* 8MB for heap, upper 8MB for KV cache */
 
 void llama_main(void) {
-    printf("llama2.c for Analogue Pocket\n\n");
+    printf("LLM Inference Engine\n\n");
 
     /* Wait for SDRAM and APF automatic data slot loading */
     while (!(SYS_STATUS & SYS_STATUS_SDRAM_READY)) {}
@@ -994,15 +1848,6 @@ void llama_main(void) {
     /* Wait for APF to finish auto-loading data slots */
     while (!(SYS_STATUS & SYS_STATUS_DATASLOT_COMPLETE)) {}
     printf("Data loaded\n");
-
-    /* Quick model sanity check */
-    volatile uint32_t *model_header = (volatile uint32_t *)MODEL_SDRAM_ADDR;
-    uint32_t dim = model_header[0];
-    if (dim == 0 || dim > 10000) {
-        printf("ERROR: Invalid model (dim=%d)\n", dim);
-        while(1);
-    }
-    printf("Model check OK (dim=%d)\n", dim);
 
     /* Test PSRAM write/read from CPU */
     volatile uint32_t *test_addr = (volatile uint32_t *)HEAP_PSRAM_ADDR;
@@ -1014,12 +1859,45 @@ void llama_main(void) {
     heap_init((void*)HEAP_PSRAM_ADDR, HEAP_SIZE);
     printf("PSRAM heap OK\n");
 
-    /* Build transformer from loaded data */
-    Transformer transformer;
-    build_transformer_from_memory(&transformer, (void*)MODEL_SDRAM_ADDR, 0);
-    printf("Model: dim=%d layers=%d vocab=%d\n",
-           transformer.config.dim, transformer.config.n_layers, transformer.config.vocab_size);
+    /* Check if model is GGUF format */
+    volatile uint32_t *model_header = (volatile uint32_t *)MODEL_SDRAM_ADDR;
+    uint32_t magic = model_header[0];
+    int is_gguf = (magic == GGUF_MAGIC);
 
+    Transformer transformer;
+
+    if (is_gguf) {
+        printf("Detected GGUF format model\n");
+
+        /* Initialize GGUF parser */
+        if (gguf_init(&g_gguf_ctx, (const uint8_t*)MODEL_SDRAM_ADDR, 64 * 1024 * 1024) != 0) {
+            printf("ERROR: Failed to parse GGUF header\n");
+            while(1);
+        }
+
+        /* Parse metadata */
+        if (gguf_parse_metadata(&g_gguf_ctx) != 0) {
+            printf("ERROR: Failed to parse GGUF metadata\n");
+            while(1);
+        }
+
+        /* Build transformer from GGUF */
+        if (build_transformer_from_gguf(&transformer, &g_gguf_ctx) != 0) {
+            printf("ERROR: Failed to build transformer from GGUF\n");
+            while(1);
+        }
+    } else {
+        /* Quick model sanity check for model.bin format */
+        uint32_t dim = model_header[0];
+        if (dim == 0 || dim > 10000) {
+            printf("ERROR: Invalid model (magic=0x%08X dim=%d)\n", magic, dim);
+            while(1);
+        }
+        printf("Detected model.bin format (dim=%d)\n", dim);
+
+        /* Build transformer from model.bin */
+        build_transformer_from_memory(&transformer, (void*)MODEL_SDRAM_ADDR, 0);
+    }
 #if USE_DMA_ACCEL
     /* Allocate SDRAM buffer for x vector (used by DMA accelerator) */
     {
@@ -1030,33 +1908,68 @@ void llama_main(void) {
             printf("ERROR: failed to allocate x_sdram_buf!\n");
             while(1);
         }
-        printf("DMA x buffer allocated (%d words)\n", max_dim);
+
+        /* Allocate SDRAM buffer for attention K vectors (batch processing) */
+        int head_size = transformer.config.dim / transformer.config.n_heads;
+        int k_batch_words = ATTN_BATCH_SIZE * head_size;
+        k_sdram_batch = sdram_alloc(k_batch_words * sizeof(int32_t));
+        if (!k_sdram_batch) {
+            printf("ERROR: failed to allocate k_sdram_batch!\n");
+            while(1);
+        }
     }
 
-    /* Convert weight matrices from float to Q16.16 for hardware accelerator.
-     * We convert all matmul weights but NOT:
-     * - token_embedding_table (used for lookup, not matmul)
-     * - rms weights (used element-wise, not matmul)
-     * - freq_cis (not used)
-     */
+    /* Convert weight matrices from float to Q16.16 for hardware accelerator */
+    printf("Converting weights...\n");
     {
         Config* p = &transformer.config;
         TransformerWeights* w = &transformer.weights;
         int head_size = p->dim / p->n_heads;
         size_t n_layers = p->n_layers;
 
-        printf("Converting weights to Q16.16...\n");
+        if (p->arch == ARCH_GPT2) {
+            /* GPT-2 weights - convert per-layer if using direct pointers */
+            if (w->wqkv) {
+                convert_weights_to_q16(w->wqkv, n_layers * p->dim * 3 * p->dim);
+            } else {
+                for (size_t l = 0; l < n_layers; l++) {
+                    convert_weights_to_q16(w->wqkv_layer[l], p->dim * 3 * p->dim);
+                }
+            }
+            if (w->wo) {
+                convert_weights_to_q16(w->wo, n_layers * p->dim * p->dim);
+            } else {
+                for (size_t l = 0; l < n_layers; l++) {
+                    convert_weights_to_q16(w->wo_layer[l], p->dim * p->dim);
+                }
+            }
+            if (w->ffn_up_weight) {
+                convert_weights_to_q16(w->ffn_up_weight, n_layers * p->dim * p->hidden_dim);
+            } else {
+                for (size_t l = 0; l < n_layers; l++) {
+                    convert_weights_to_q16(w->ffn_up_layer[l], p->dim * p->hidden_dim);
+                }
+            }
+            if (w->ffn_down_weight) {
+                convert_weights_to_q16(w->ffn_down_weight, n_layers * p->hidden_dim * p->dim);
+            } else {
+                for (size_t l = 0; l < n_layers; l++) {
+                    convert_weights_to_q16(w->ffn_down_layer[l], p->hidden_dim * p->dim);
+                }
+            }
+        } else {
+            /* LLaMA weights */
+            /* wq, wk, wv, wo - attention weights */
+            convert_weights_to_q16(w->wq, n_layers * p->dim * (p->n_heads * head_size));
+            convert_weights_to_q16(w->wk, n_layers * p->dim * (p->n_kv_heads * head_size));
+            convert_weights_to_q16(w->wv, n_layers * p->dim * (p->n_kv_heads * head_size));
+            convert_weights_to_q16(w->wo, n_layers * (p->n_heads * head_size) * p->dim);
 
-        /* wq, wk, wv, wo - attention weights */
-        convert_weights_to_q16(w->wq, n_layers * p->dim * (p->n_heads * head_size));
-        convert_weights_to_q16(w->wk, n_layers * p->dim * (p->n_kv_heads * head_size));
-        convert_weights_to_q16(w->wv, n_layers * p->dim * (p->n_kv_heads * head_size));
-        convert_weights_to_q16(w->wo, n_layers * (p->n_heads * head_size) * p->dim);
-
-        /* w1, w2, w3 - FFN weights */
-        convert_weights_to_q16(w->w1, n_layers * p->dim * p->hidden_dim);
-        convert_weights_to_q16(w->w2, n_layers * p->hidden_dim * p->dim);
-        convert_weights_to_q16(w->w3, n_layers * p->dim * p->hidden_dim);
+            /* w1, w2, w3 - FFN weights */
+            convert_weights_to_q16(w->w1, n_layers * p->dim * p->hidden_dim);
+            convert_weights_to_q16(w->w2, n_layers * p->hidden_dim * p->dim);
+            convert_weights_to_q16(w->w3, n_layers * p->dim * p->hidden_dim);
+        }
 
         /* wcls - output projection (may be shared with embedding) */
         if (w->wcls != w->token_embedding_table) {
@@ -1064,14 +1977,8 @@ void llama_main(void) {
         }
 
         weights_converted = 1;
-        printf("Weights converted!\n");
     }
 #endif
-
-    /* Build tokenizer from SDRAM */
-    Tokenizer tokenizer;
-    build_tokenizer_from_memory(&tokenizer, (void*)TOKENIZER_SDRAM_ADDR, transformer.config.vocab_size);
-    g_tokenizer = &tokenizer;
 
     /* Build sampler */
     Sampler sampler;
@@ -1081,12 +1988,22 @@ void llama_main(void) {
     printf("\n--- Generating ---\n");
     printf("Prompt: \"%s\"\n\n", DEFAULT_PROMPT);
 
-    generate(&transformer, &tokenizer, &sampler, (char*)DEFAULT_PROMPT, DEFAULT_STEPS);
+    if (is_gguf) {
+        /* Generate using GGUF tokenizer */
+        generate_gguf(&transformer, &g_gguf_ctx, &sampler, (char*)DEFAULT_PROMPT, DEFAULT_STEPS);
+    } else {
+        /* Build tokenizer from SDRAM (model.bin format) */
+        Tokenizer tokenizer;
+        build_tokenizer_from_memory(&tokenizer, (void*)TOKENIZER_SDRAM_ADDR, transformer.config.vocab_size);
+        g_tokenizer = &tokenizer;
+
+        generate(&transformer, &tokenizer, &sampler, (char*)DEFAULT_PROMPT, DEFAULT_STEPS);
+        free_tokenizer(&tokenizer);
+    }
 
     /* Cleanup */
     printf("\nCleaning up...\n");
     free_sampler(&sampler);
-    free_tokenizer(&tokenizer);
     free_transformer(&transformer);
 
     printf("Done!\n");

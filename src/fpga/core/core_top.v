@@ -261,8 +261,9 @@ assign port_tran_sck_dir = 1'b0;    // clock direction can change
 assign port_tran_sd = 1'bz;
 assign port_tran_sd_dir = 1'b0;     // SD is input and not used
 
-// PSRAM controller for CRAM0 (8MB accessible via CPU)
+// PSRAM controller for CRAM0+CRAM1 (16MB total accessible via CPU)
 // Memory map: 0x30000000 - 0x30FFFFFF (16MB byte addressable, 4M words)
+// Address bit 23 selects chip: CRAM0 (0x30000000-0x307FFFFF) or CRAM1 (0x30800000-0x30FFFFFF)
 wire        cpu_psram_rd;
 wire        cpu_psram_wr;
 wire [21:0] cpu_psram_addr;
@@ -499,12 +500,36 @@ assign cpu_sdram_busy = ram1_word_busy;
 //
 // host/target command handler
 //
-    wire            reset_n;                // driven by host commands, can be used as core-wide reset
+    wire            reset_n_apf;            // driven by host commands from APF bridge
     wire    [31:0]  cmd_bridge_rd_data;
-    
+
+    // JTAG Debug bypass: Force reset_n after short timeout for development
+    // NOTE: Does not work because APF video scaler requires bridge communication
+    // `define JTAG_DEBUG_BYPASS  // Uncomment for JTAG debugging (doesn't work fully)
+    `ifdef JTAG_DEBUG_BYPASS
+    reg [24:0] jtag_reset_counter;
+    reg        jtag_reset_force;
+    always @(posedge clk_74a) begin
+        if (!pll_core_locked_s) begin
+            jtag_reset_counter <= 0;
+            jtag_reset_force <= 0;
+        end else if (!reset_n_apf && !jtag_reset_force) begin
+            // Wait ~0.5 seconds for APF to deassert reset (74.25 MHz * 0.5 = 37.125M)
+            if (jtag_reset_counter < 25'd37125000) begin
+                jtag_reset_counter <= jtag_reset_counter + 1;
+            end else begin
+                jtag_reset_force <= 1;
+            end
+        end
+    end
+    wire reset_n = reset_n_apf | jtag_reset_force;
+    `else
+    wire reset_n = reset_n_apf;
+    `endif
+
 // bridge host commands
 // synchronous to clk_74a
-    wire            status_boot_done = pll_core_locked_s; 
+    wire            status_boot_done = pll_core_locked_s;
     wire            status_setup_done = pll_core_locked_s; // rising edge triggers a target command
     wire            status_running = reset_n; // we are running as soon as reset_n goes high
 
@@ -523,7 +548,32 @@ assign cpu_sdram_busy = ram1_word_busy;
     wire    [15:0]  dataslot_update_id;
     wire    [31:0]  dataslot_update_size;
     
-    wire            dataslot_allcomplete;
+    wire            dataslot_allcomplete_apf;
+
+    // JTAG Debug bypass: Force dataslot_allcomplete after timeout for development
+    // When programming via JTAG, APF doesn't run so we force the signal after 2 seconds
+    `ifdef JTAG_DEBUG_BYPASS
+    reg [27:0] jtag_timeout_counter;
+    reg        jtag_dataslot_force;
+    always @(posedge clk_74a or negedge reset_n) begin
+        if (~reset_n) begin
+            jtag_timeout_counter <= 0;
+            jtag_dataslot_force <= 0;
+        end else begin
+            if (!dataslot_allcomplete_apf && !jtag_dataslot_force) begin
+                // Count for ~2 seconds at 74.25 MHz (148.5M cycles)
+                if (jtag_timeout_counter < 28'd148500000) begin
+                    jtag_timeout_counter <= jtag_timeout_counter + 1;
+                end else begin
+                    jtag_dataslot_force <= 1;
+                end
+            end
+        end
+    end
+    wire dataslot_allcomplete = dataslot_allcomplete_apf | jtag_dataslot_force;
+    `else
+    wire dataslot_allcomplete = dataslot_allcomplete_apf;
+    `endif
 
     wire     [31:0] rtc_epoch_seconds;
     wire     [31:0] rtc_date_bcd;
@@ -582,7 +632,7 @@ assign cpu_sdram_busy = ram1_word_busy;
 core_bridge_cmd icb (
 
     .clk                ( clk_74a ),
-    .reset_n            ( reset_n ),
+    .reset_n            ( reset_n_apf ),
 
     .bridge_endian_little   ( bridge_endian_little ),
     .bridge_addr            ( bridge_addr ),
@@ -610,7 +660,7 @@ core_bridge_cmd icb (
     .dataslot_update_id         ( dataslot_update_id ),
     .dataslot_update_size       ( dataslot_update_size ),
     
-    .dataslot_allcomplete   ( dataslot_allcomplete ),
+    .dataslot_allcomplete   ( dataslot_allcomplete_apf ),
 
     .rtc_epoch_seconds      ( rtc_epoch_seconds ),
     .rtc_date_bcd           ( rtc_date_bcd ),

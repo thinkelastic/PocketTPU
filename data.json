@@ -4,25 +4,13 @@
         "data_slots": [
             {
                 "id": 0,
-                "name": "Model Weights",
+                "name": "GGUF Model",
                 "required": true,
                 "parameters": 0,
                 "extensions": [
-                    "bin"
+                    "gguf"
                 ],
-                "filename": "model.bin",
                 "address": "0x00000000"
-            },
-            {
-                "id": 1,
-                "name": "Tokenizer",
-                "required": true,
-                "parameters": 0,
-                "extensions": [
-                    "bin"
-                ],
-                "filename": "tokenizer.bin",
-                "address": "0x03F00000"
             }
         ]
     }

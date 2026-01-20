@@ -149,6 +149,10 @@ double sin(double x);
 double cos(double x);
 double tan(double x);
 
+/* Hyperbolic */
+float tanhf(float x);
+double tanh(double x);
+
 /* Floor/ceiling */
 float floorf(float x);
 float ceilf(float x);

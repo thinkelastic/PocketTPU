@@ -18,7 +18,7 @@ FPGA_CORE_DIR = ../fpga/core
 LIBC_DIR = libc
 
 # Source files - Core
-SRCS_C = main.c terminal.c dataslot.c llama_embedded.c memtest.c
+SRCS_C = main.c terminal.c dataslot.c llama_embedded.c memtest.c gguf.c
 
 # Source files - libc
 LIBC_SRCS = $(LIBC_DIR)/memory.c \

@@ -128,38 +128,54 @@ Default settings in `llama_embedded.c`:
 - `DEFAULT_PROMPT`: "Once upon a time"
 - `USE_DOT_ACCEL`: 1 (enable hardware accelerator)
 
-## Dot Product Accelerator
+## DMA Dot Product Accelerator
 
-A custom hardware accelerator for dot product operations, used to speed up matrix-vector multiplications in the neural network.
+A custom hardware accelerator for dot product operations using DMA from SDRAM, used to speed up matrix-vector multiplications in the neural network.
 
 ### Hardware Design
 
-- **4 parallel multipliers** using DSP blocks
-- **16-element vector registers** for batch processing
+- **DMA burst reads** directly from SDRAM for zero-copy vector access
+- **512-element vector buffers** in BRAM for large batch processing
 - **Q16.16 fixed-point arithmetic** for weights and activations
 - **64-bit accumulator** to handle overflow from large vectors
+- **3-stage pipelined MAC** for high throughput
+- **B-caching optimization** - preload input vector once, reuse for all weight rows
+
+### Performance
+
+| Configuration | Speed |
+|--------------|-------|
+| Software only | 24 tok/min |
+| DMA accelerator | 77 tok/min |
+| DMA + B-caching | 84 tok/min |
 
 ### Register Map
 
 | Offset | Register | Description |
 |--------|----------|-------------|
-| `0x00` | CTRL | Write 1 to start, bit 0 = busy status |
-| `0x04` | LENGTH | Vector length (1-16 elements) |
+| `0x00` | CTRL | Control/status: bit 0=start, bit 1=use_cached_b, bit 2=preload_b_only |
+| `0x04` | LENGTH | Vector length (up to 512 elements) |
 | `0x08` | RESULT_LO | Low 32 bits of 64-bit result |
 | `0x0C` | RESULT_HI | High 32 bits of 64-bit result |
-| `0x10-0x4C` | VEC_A | First vector elements (16 words) |
-| `0x50-0x8C` | VEC_B | Second vector elements (16 words) |
+| `0x10` | ADDR_A | SDRAM word address for vector A |
+| `0x14` | ADDR_B | SDRAM word address for vector B |
 
 ### Usage
 
 ```c
-#include "dot_accel.h"
+#include "dma_dot_accel.h"
 
-// Compute dot product of two float vectors
-float result = dot_product_accel(vec_a, vec_b, length);
+// Preload x vector for B-caching (call once per matmul)
+dma_dot_preload_b_vector(x_q16, n);
+
+// Compute dot products using cached B
+for (int i = 0; i < d; i++) {
+    int64_t result = dma_dot_product_q16_cached(weights + i*n, n);
+    output[i] = Q32_TO_FLOAT(result);
+}
 ```
 
-The accelerator handles vectors larger than 16 elements by batching. Weights can be pre-converted to Q16.16 format at startup to reduce runtime conversion overhead.
+The B-caching optimization preloads the input vector once into hardware BRAM, then reuses it for all weight rows in the matmul. This reduces DMA bandwidth by ~50% for the input vector fetches.
 
 ## Firmware Development
 
