@@ -28,9 +28,10 @@
 
 // Fixed-point Q16.16 conversion macros
 #define FLOAT_TO_Q16(f) ((int32_t)((f) * 65536.0f))
-#define Q16_TO_FLOAT(q) ((float)(q) / 65536.0f)
+#define Q16_TO_FLOAT(q) ((float)(q) * (1.0f / 65536.0f))
 // Result is Q32.32 after multiplication of two Q16.16 numbers
-#define Q32_TO_FLOAT(q) ((float)(q) / (65536.0f * 65536.0f))
+// Use multiply by reciprocal instead of divide - faster on soft CPU
+#define Q32_TO_FLOAT(q) ((float)(q) * 2.3283064365386963e-10f)
 
 // Check if accelerator is busy
 static inline int dot_accel_busy(void) {

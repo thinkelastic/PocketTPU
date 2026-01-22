@@ -29,7 +29,7 @@
 `default_nettype none
 
 module dma_dot_product #(
-    parameter MAX_LENGTH = 512    // Maximum vector length
+    parameter MAX_LENGTH = 512   // Maximum vector length
 ) (
     input wire clk,
     input wire reset_n,
@@ -291,13 +291,12 @@ always @(posedge clk or negedge reset_n) begin
             end
 
             STATE_COMPUTE: begin
-                // 2-way parallel compute - no concurrent fetch
+                // 2-way parallel computation from vec_a buffers
                 if (comp_idx < vec_length) begin
-                    // Read 2 elements in parallel
                     op_a0 <= vec_a_read0; op_b0 <= vec_b[comp_idx];
                     op_a1 <= vec_a_read1; op_b1 <= vec_b[comp_idx+1];
                     pipe1_valid <= 1;
-                    comp_idx <= comp_idx + 2;  // Process 2 elements per cycle
+                    comp_idx <= comp_idx + 2;
                 end else begin
                     pipe1_valid <= 0;
                 end
@@ -316,6 +315,7 @@ always @(posedge clk or negedge reset_n) begin
                     accumulator <= accumulator + prod0 + prod1;
                 end
 
+                // Done when all elements processed
                 if (comp_idx >= vec_length && !pipe1_valid && !pipe2_valid) begin
                     state <= STATE_DONE;
                 end
@@ -326,7 +326,7 @@ always @(posedge clk or negedge reset_n) begin
 
                 // 2-way parallel computation pipeline
                 if (comp_idx < vec_length) begin
-                    // Read 2 elements in parallel
+                    // Read 2 elements in parallel from active buffer
                     op_a0 <= vec_a_read0; op_b0 <= vec_b[comp_idx];
                     op_a1 <= vec_a_read1; op_b1 <= vec_b[comp_idx+1];
                     pipe1_valid <= 1;

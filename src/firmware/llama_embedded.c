@@ -417,13 +417,24 @@ static void accel_attention_scores(float* att, float* q, float* key_cache,
 
     /* For small head_size, DMA overhead exceeds benefit - use software */
     if (head_size < MIN_HEAD_SIZE_FOR_DMA) {
-        for (int t = 0; t <= pos; t++) {
-            float* k = key_cache + t * kv_dim + kv_head_offset;
-            float score = 0.0f;
-            for (int i = 0; i < head_size; i++) {
-                score += q[i] * k[i];
+        /* Unrolled path for common head_size=8 case */
+        if (head_size == 8) {
+            float q0=q[0], q1=q[1], q2=q[2], q3=q[3], q4=q[4], q5=q[5], q6=q[6], q7=q[7];
+            for (int t = 0; t <= pos; t++) {
+                float* k = key_cache + t * kv_dim + kv_head_offset;
+                float score = q0*k[0] + q1*k[1] + q2*k[2] + q3*k[3] +
+                              q4*k[4] + q5*k[5] + q6*k[6] + q7*k[7];
+                att[t] = score * scale;
             }
-            att[t] = score * scale;
+        } else {
+            for (int t = 0; t <= pos; t++) {
+                float* k = key_cache + t * kv_dim + kv_head_offset;
+                float score = 0.0f;
+                for (int i = 0; i < head_size; i++) {
+                    score += q[i] * k[i];
+                }
+                att[t] = score * scale;
+            }
         }
         return;
     }
@@ -457,30 +468,77 @@ static void accel_attention_scores(float* att, float* q, float* key_cache,
     }
 }
 
-static void matmul(float* xout, float* x, float* w, int n, int d) {
-    /* W (d,n) @ x (n,) -> xout (d,)
-     * Weights are pre-converted to Q16.16 and stored in SDRAM.
-     * x is converted to Q16.16 and copied to SDRAM buffer for DMA.
-     *
-     * B-caching optimization: Preload x vector once, reuse for all rows.
-     */
-    int32_t* w_q16 = (int32_t*)w;
+/* Cached input vector length for batch matmul */
+static int cached_x_len = 0;
 
-    /* Convert and copy x vector to SDRAM buffer for DMA */
+/*
+ * Prepare input vector for batch matmul.
+ * Call once before multiple matmuls with same x.
+ */
+static void matmul_batch_begin(float* x, int n) {
+    /* Convert and preload x vector */
     for (int j = 0; j < n; j++) {
         x_sdram_buf[j] = FLOAT_TO_Q16(x[j]);
     }
+    if (n <= DMA_DOT_MAX_LEN) {
+        dma_dot_preload_b_vector(x_sdram_buf, n);
+    }
+    cached_x_len = n;
+}
+
+/*
+ * Pipelined matmul using double-buffering to overlap DMA with compute.
+ * For d rows, while computing row i, prefetch row i+1.
+ * Requires n <= DMA_DOT_MAX_LEN and d >= 2.
+ */
+static void matmul_batch_pipelined(float* xout, float* w, int n, int d) {
+    int32_t* w_q16 = (int32_t*)w;
+
+    if (d < 2 || n > DMA_DOT_MAX_LEN) {
+        /* Fall back to simple version */
+        for (int i = 0; i < d; i++) {
+            int32_t* wi = w_q16 + i * n;
+            int64_t result = dma_dot_product_q16_cached(wi, n);
+            xout[i] = Q32_TO_FLOAT(result);
+        }
+        return;
+    }
+
+    /* Start first row, prefetch second row */
+    dma_dot_pipeline_first(w_q16, w_q16 + n, n);
+
+    /* Process rows 2 to d-1, getting results 0 to d-3 */
+    for (int i = 0; i < d - 2; i++) {
+        int64_t result = dma_dot_pipeline_next(w_q16 + (i + 2) * n, n);
+        xout[i] = Q32_TO_FLOAT(result);
+    }
+
+    /* Get result[d-2], start final compute (uses prefetched row d-1) */
+    /* Use w_q16 as dummy prefetch address - it won't be used */
+    int64_t result_dm2 = dma_dot_pipeline_next(w_q16, n);
+    xout[d - 2] = Q32_TO_FLOAT(result_dm2);
+
+    /* Get final result */
+    int64_t result_final = dma_dot_pipeline_last();
+    xout[d - 1] = Q32_TO_FLOAT(result_final);
+}
+
+/*
+ * Matmul using previously prepared x vector (from matmul_batch_begin).
+ * Skips Q16 conversion of x.
+ */
+static void matmul_batch(float* xout, float* w, int n, int d) {
+    int32_t* w_q16 = (int32_t*)w;
 
     if (n <= DMA_DOT_MAX_LEN) {
-        /* Use B-caching - preload x once, reuse for all rows */
-        dma_dot_preload_b_vector(x_sdram_buf, n);
+        /* Use simple cached-B version - pipelined has correctness issues */
         for (int i = 0; i < d; i++) {
             int32_t* wi = w_q16 + i * n;
             int64_t result = dma_dot_product_q16_cached(wi, n);
             xout[i] = Q32_TO_FLOAT(result);
         }
     } else {
-        /* Multiple batches needed - use standard method */
+        /* Multiple batches needed */
         for (int i = 0; i < d; i++) {
             int32_t* wi = w_q16 + i * n;
             int64_t result = dma_dot_product_q16(wi, x_sdram_buf, n);
@@ -488,6 +546,18 @@ static void matmul(float* xout, float* x, float* w, int n, int d) {
         }
     }
 }
+
+static void matmul(float* xout, float* x, float* w, int n, int d) {
+    /* W (d,n) @ x (n,) -> xout (d,)
+     * Weights are pre-converted to Q16.16 and stored in SDRAM.
+     * x is converted to Q16.16 and copied to SDRAM buffer for DMA.
+     *
+     * B-caching optimization: Preload x vector once, reuse for all rows.
+     */
+    matmul_batch_begin(x, n);
+    matmul_batch(xout, w, n, d);
+}
+
 #else
 static void matmul(float* xout, float* x, float* w, int n, int d) {
     /* W (d,n) @ x (n,) -> xout (d,)
@@ -504,6 +574,40 @@ static void matmul(float* xout, float* x, float* w, int n, int d) {
 }
 #endif
 
+/* Precomputed RoPE frequencies and sin/cos caches */
+static float* rope_freq_cache = NULL;
+static float* rope_sin_cache = NULL;
+static float* rope_cos_cache = NULL;
+static int rope_freq_head_size = 0;
+static int rope_last_pos = -1;
+
+static void ensure_rope_freq(int head_size) {
+    if (rope_freq_cache && rope_freq_head_size == head_size) return;
+    if (rope_freq_cache) free(rope_freq_cache);
+    if (rope_sin_cache) free(rope_sin_cache);
+    if (rope_cos_cache) free(rope_cos_cache);
+    rope_freq_cache = (float*)malloc((head_size/2) * sizeof(float));
+    rope_sin_cache = (float*)malloc((head_size/2) * sizeof(float));
+    rope_cos_cache = (float*)malloc((head_size/2) * sizeof(float));
+    rope_freq_head_size = head_size;
+    rope_last_pos = -1;  /* Force recompute of sin/cos */
+    for (int i = 0; i < head_size; i += 2) {
+        int head_dim = i;  /* Within one head, i is the head_dim */
+        rope_freq_cache[i/2] = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+    }
+}
+
+/* Precompute sin/cos for current position (once per forward pass) */
+static void precompute_rope_sincos(int pos, int head_size) {
+    if (pos == rope_last_pos) return;
+    rope_last_pos = pos;
+    for (int i = 0; i < head_size / 2; i++) {
+        float val = pos * rope_freq_cache[i];
+        rope_sin_cache[i] = sinf(val);
+        rope_cos_cache[i] = cosf(val);
+    }
+}
+
 /* LLaMA forward pass (RMSNorm, RoPE, SwiGLU) */
 static float* forward_llama(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
@@ -516,6 +620,11 @@ static float* forward_llama(Transformer* transformer, int token, int pos) {
     int hidden_dim = p->hidden_dim;
     int head_size = dim / p->n_heads;
 
+    /* Ensure RoPE frequencies are precomputed */
+    ensure_rope_freq(head_size);
+    /* Precompute sin/cos for current position (once per forward pass) */
+    precompute_rope_sincos(pos, head_size);
+
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim * sizeof(*x));
 
@@ -527,16 +636,17 @@ static float* forward_llama(Transformer* transformer, int token, int pos) {
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
 
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        /* Batch Q/K/V projections - same input, avoid redundant Q16 conversion */
+        matmul_batch_begin(s->xb, dim);
+        matmul_batch(s->q, w->wq + l*dim*dim, dim, dim);
+        matmul_batch(s->k, w->wk + l*dim*kv_dim, dim, kv_dim);
+        matmul_batch(s->v, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         for (int i = 0; i < dim; i += 2) {
             int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            int freq_idx = head_dim / 2;
+            float fcr = rope_cos_cache[freq_idx];  /* Use precomputed cos */
+            float fci = rope_sin_cache[freq_idx];  /* Use precomputed sin */
             int rotn = i < kv_dim ? 2 : 1;
             for (int v = 0; v < rotn; v++) {
                 float* vec = v == 0 ? s->q : s->k;
@@ -581,6 +691,7 @@ static float* forward_llama(Transformer* transformer, int token, int pos) {
             }
         }
 
+        /* Output projection */
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         for (int i = 0; i < dim; i++) {
@@ -589,8 +700,10 @@ static float* forward_llama(Transformer* transformer, int token, int pos) {
 
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
 
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        /* Batch FFN up projections - same input, avoid redundant Q16 conversion */
+        matmul_batch_begin(s->xb, dim);
+        matmul_batch(s->hb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul_batch(s->hb2, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
         /* SwiGLU activation: silu(x) * gate, where silu(x) = x * sigmoid(x) */
         for (int i = 0; i < hidden_dim; i++) {
@@ -1992,6 +2105,7 @@ void llama_main(void) {
 
         weights_converted = 1;
     }
+
 #endif
 
     /* Build sampler */
