@@ -350,13 +350,25 @@ static void layernorm(float* o, float* x, float* weight, float* bias, int size) 
     }
 }
 
+/* Fast exp approximation using IEEE 754 bit manipulation.
+ * ~4% max error but much faster than software expf on soft CPU without FPU.
+ * Valid for x in [-87, 88] range (covers typical neural network values). */
+static inline float fast_expf(float x) {
+    /* Clamp to valid range to avoid overflow/underflow */
+    if (x < -87.0f) return 0.0f;
+    if (x > 88.0f) return 3.4e38f;  /* Large but not inf */
+    union { float f; int32_t i; } u;
+    u.i = (int32_t)(12102203.0f * x + 1064872507.0f);
+    return u.f;
+}
+
 /* GELU activation (for GPT-2) - approximation using tanh */
 static float gelu(float x) {
     /* GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
     float x3 = x * x * x;
     float tanh_arg = 0.7978845608f * (x + 0.044715f * x3);
-    /* tanh approximation using exp */
-    float exp2x = expf(2.0f * tanh_arg);
+    /* tanh approximation using fast_exp */
+    float exp2x = fast_expf(2.0f * tanh_arg);
     float tanh_val = (exp2x - 1.0f) / (exp2x + 1.0f);
     return 0.5f * x * (1.0f + tanh_val);
 }
@@ -370,11 +382,12 @@ static void softmax(float* x, int size) {
     }
     float sum = 0.0f;
     for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
+        x[i] = fast_expf(x[i] - max_val);
         sum += x[i];
     }
+    float inv_sum = 1.0f / sum;
     for (int i = 0; i < size; i++) {
-        x[i] /= sum;
+        x[i] *= inv_sum;
     }
 }
 
@@ -681,12 +694,27 @@ static float* forward_llama(Transformer* transformer, int token, int pos) {
             softmax(att, pos + 1);
 
             float* xb = s->xb + h * head_size;
-            memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                float a = att[t];
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
+            int kv_head_off = (h / kv_mul) * head_size;
+
+            /* Unrolled attention value accumulation for head_size=8 */
+            if (head_size == 8) {
+                float xb0=0, xb1=0, xb2=0, xb3=0, xb4=0, xb5=0, xb6=0, xb7=0;
+                for (int t = 0; t <= pos; t++) {
+                    float* v = s->value_cache + loff + t * kv_dim + kv_head_off;
+                    float a = att[t];
+                    xb0 += a * v[0]; xb1 += a * v[1]; xb2 += a * v[2]; xb3 += a * v[3];
+                    xb4 += a * v[4]; xb5 += a * v[5]; xb6 += a * v[6]; xb7 += a * v[7];
+                }
+                xb[0]=xb0; xb[1]=xb1; xb[2]=xb2; xb[3]=xb3;
+                xb[4]=xb4; xb[5]=xb5; xb[6]=xb6; xb[7]=xb7;
+            } else {
+                memset(xb, 0, head_size * sizeof(float));
+                for (int t = 0; t <= pos; t++) {
+                    float* v = s->value_cache + loff + t * kv_dim + kv_head_off;
+                    float a = att[t];
+                    for (int i = 0; i < head_size; i++) {
+                        xb[i] += a * v[i];
+                    }
                 }
             }
         }
@@ -708,7 +736,7 @@ static float* forward_llama(Transformer* transformer, int token, int pos) {
         /* SwiGLU activation: silu(x) * gate, where silu(x) = x * sigmoid(x) */
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
-            val *= (1.0f / (1.0f + expf(-val)));
+            val *= (1.0f / (1.0f + fast_expf(-val)));
             val *= s->hb2[i];
             s->hb[i] = val;
         }
