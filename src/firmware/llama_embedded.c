@@ -313,14 +313,23 @@ static void free_transformer(Transformer* t) {
  * Neural network operations
  * ============================================ */
 
+/* Fast inverse square root using Quake/Newton-Raphson method.
+ * ~1% error, much faster than 1/sqrtf on soft CPU without FPU. */
+static inline float fast_rsqrtf(float x) {
+    union { float f; int32_t i; } u = {x};
+    u.i = 0x5f3759df - (u.i >> 1);  /* Initial approximation */
+    u.f *= 1.5f - (0.5f * x * u.f * u.f);  /* One Newton iteration */
+    return u.f;
+}
+
 static void rmsnorm(float* o, float* x, float* weight, int size) {
     float ss = 0.0f;
     for (int j = 0; j < size; j++) {
         ss += x[j] * x[j];
     }
-    ss /= size;
-    ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
+    /* Use multiply by reciprocal and fast inverse sqrt */
+    ss = ss * (1.0f / size) + 1e-5f;
+    ss = fast_rsqrtf(ss);
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
     }
@@ -328,12 +337,14 @@ static void rmsnorm(float* o, float* x, float* weight, int size) {
 
 /* LayerNorm with bias (for GPT-2) */
 static void layernorm(float* o, float* x, float* weight, float* bias, int size) {
+    float inv_size = 1.0f / size;
+
     /* Calculate mean */
     float mean = 0.0f;
     for (int j = 0; j < size; j++) {
         mean += x[j];
     }
-    mean /= size;
+    mean *= inv_size;
 
     /* Calculate variance */
     float var = 0.0f;
@@ -341,10 +352,9 @@ static void layernorm(float* o, float* x, float* weight, float* bias, int size) 
         float diff = x[j] - mean;
         var += diff * diff;
     }
-    var /= size;
 
-    /* Normalize and scale */
-    float inv_std = 1.0f / sqrtf(var + 1e-5f);
+    /* Normalize and scale using fast inverse sqrt */
+    float inv_std = fast_rsqrtf(var * inv_size + 1e-5f);
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * ((x[j] - mean) * inv_std) + bias[j];
     }
@@ -426,18 +436,20 @@ static int32_t* k_sdram_batch = NULL;
  * Copies K vectors from PSRAM to SDRAM in batches, then uses hardware accelerator */
 static void accel_attention_scores(float* att, float* q, float* key_cache,
                                    int pos, int head_size, int kv_dim, int kv_head_offset) {
-    float scale = 1.0f / sqrtf((float)head_size);
+    float scale = fast_rsqrtf((float)head_size);
 
     /* For small head_size, DMA overhead exceeds benefit - use software */
     if (head_size < MIN_HEAD_SIZE_FOR_DMA) {
         /* Unrolled path for common head_size=8 case */
         if (head_size == 8) {
+            /* Precomputed scale for head_size=8: 1/sqrt(8) = 0.35355339f */
+            const float scale8 = 0.35355339f;
             float q0=q[0], q1=q[1], q2=q[2], q3=q[3], q4=q[4], q5=q[5], q6=q[6], q7=q[7];
             for (int t = 0; t <= pos; t++) {
                 float* k = key_cache + t * kv_dim + kv_head_offset;
                 float score = q0*k[0] + q1*k[1] + q2*k[2] + q3*k[3] +
                               q4*k[4] + q5*k[5] + q6*k[6] + q7*k[7];
-                att[t] = score * scale;
+                att[t] = score * scale8;
             }
         } else {
             for (int t = 0; t <= pos; t++) {

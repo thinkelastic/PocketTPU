@@ -174,6 +174,7 @@ Discarded input sections
  .bss           0x00000000        0x0 libc/math.o
  .text.fabsf    0x00000000        0xc libc/math.o
  .text.fabs     0x00000000        0xc libc/math.o
+ .text.sqrtf    0x00000000      0x184 libc/math.o
  .text.sqrt     0x00000000      0x19c libc/math.o
  .text.expf     0x00000000       0xb8 libc/math.o
  .text.exp      0x00000000      0x100 libc/math.o
@@ -468,7 +469,7 @@ LOAD /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a
                 0x10000000                        __sdram_base = 0x10000000
                 0x04000000                        __sdram_size = 0x4000000
 
-.text           0x00000000     0xba2c
+.text           0x00000000     0xb8d4
  *(.text.start)
  .text.start    0x00000000       0x30 start.o
                 0x00000000                _start
@@ -488,260 +489,259 @@ LOAD /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a
  .text.term_printf
                 0x00000308      0x3bc terminal.o
                 0x00000308                term_printf
- .text.matmul_batch_begin
-                0x000006c4       0xd8 llama_embedded.o
- .text.compare_prob
-                0x0000079c       0x64 llama_embedded.o
- .text.malloc_run_state
-                0x00000800      0x2d0 llama_embedded.o
+ .text.rmsnorm  0x000006c4      0x144 llama_embedded.o
  .text.layernorm
-                0x00000ad0      0x19c llama_embedded.o
- .text.rmsnorm  0x00000c6c      0x13c llama_embedded.o
+                0x00000808      0x1a0 llama_embedded.o
+ .text.matmul_batch_begin
+                0x000009a8       0xd8 llama_embedded.o
+ .text.compare_prob
+                0x00000a80       0x64 llama_embedded.o
+ .text.malloc_run_state
+                0x00000ae4      0x2d0 llama_embedded.o
  .text.matmul_batch
-                0x00000da8      0x240 llama_embedded.o
+                0x00000db4      0x240 llama_embedded.o
  .text.load_tensor_to_buffer.constprop.0
-                0x00000fe8      0x214 llama_embedded.o
+                0x00000ff4      0x214 llama_embedded.o
  .text.get_or_load_tensor.constprop.0
-                0x000011fc      0x108 llama_embedded.o
- .text.softmax  0x00001304      0x1a0 llama_embedded.o
- .text.sample   0x000014a4      0x3dc llama_embedded.o
+                0x00001208      0x108 llama_embedded.o
+ .text.softmax  0x00001310      0x1a0 llama_embedded.o
+ .text.sample   0x000014b0      0x3e4 llama_embedded.o
  .text.accel_attention_scores
-                0x00001880      0x4d4 llama_embedded.o
+                0x00001894      0x500 llama_embedded.o
  .text.forward_gpt2
-                0x00001d54      0x87c llama_embedded.o
+                0x00001d94      0x824 llama_embedded.o
  .text.forward_llama
-                0x000025d0      0xc80 llama_embedded.o
+                0x000025b8      0xc78 llama_embedded.o
  .text.llama_main
-                0x00003250     0x287c llama_embedded.o
-                0x00003250                llama_main
+                0x00003230     0x287c llama_embedded.o
+                0x00003230                llama_main
  .text.read_u32
-                0x00005acc       0x38 gguf.o
+                0x00005aac       0x38 gguf.o
  .text.strncmp_len
-                0x00005b04       0x80 gguf.o
+                0x00005ae4       0x80 gguf.o
  .text.skip_gguf_value
-                0x00005b84      0x1a0 gguf.o
+                0x00005b64      0x1a0 gguf.o
  .text.gguf_init
-                0x00005d24      0x228 gguf.o
-                0x00005d24                gguf_init
+                0x00005d04      0x228 gguf.o
+                0x00005d04                gguf_init
  .text.gguf_parse_metadata
-                0x00005f4c      0x8b8 gguf.o
-                0x00005f4c                gguf_parse_metadata
+                0x00005f2c      0x8b8 gguf.o
+                0x00005f2c                gguf_parse_metadata
  .text.gguf_find_tensor
-                0x00006804      0x4c8 gguf.o
-                0x00006804                gguf_find_tensor
+                0x000067e4      0x4c8 gguf.o
+                0x000067e4                gguf_find_tensor
  .text.gguf_get_tensor_data
-                0x00006ccc       0x24 gguf.o
-                0x00006ccc                gguf_get_tensor_data
+                0x00006cac       0x24 gguf.o
+                0x00006cac                gguf_get_tensor_data
  .text.gguf_get_vocab_string
-                0x00006cf0      0x154 gguf.o
-                0x00006cf0                gguf_get_vocab_string
+                0x00006cd0      0x154 gguf.o
+                0x00006cd0                gguf_get_vocab_string
  .text.heap_init
-                0x00006e44       0x34 libc/memory.o
-                0x00006e44                heap_init
- .text.malloc   0x00006e78       0x98 libc/memory.o
-                0x00006e78                malloc
- .text.free     0x00006f10       0x9c libc/memory.o
-                0x00006f10                free
- .text.memcpy   0x00006fac       0x7c libc/memory.o
-                0x00006fac                memcpy
- .text.memset   0x00007028       0x80 libc/memory.o
-                0x00007028                memset
- .text.memcmp   0x000070a8       0x3c libc/memory.o
-                0x000070a8                memcmp
- .text.strlen   0x000070e4       0x28 libc/string.o
-                0x000070e4                strlen
- .text.strcmp   0x0000710c       0x44 libc/string.o
-                0x0000710c                strcmp
- .text.strchr   0x00007150       0x2c libc/string.o
-                0x00007150                strchr
- .text.isprint  0x0000717c        0xc libc/ctype.o
-                0x0000717c                isprint
- .text.isspace  0x00007188       0x1c libc/ctype.o
-                0x00007188                isspace
- .text.abs      0x000071a4       0x10 libc/stdlib.o
-                0x000071a4                abs
- .text.qsort    0x000071b4      0x370 libc/qsort.o
-                0x000071b4                qsort
+                0x00006e24       0x34 libc/memory.o
+                0x00006e24                heap_init
+ .text.malloc   0x00006e58       0x98 libc/memory.o
+                0x00006e58                malloc
+ .text.free     0x00006ef0       0x9c libc/memory.o
+                0x00006ef0                free
+ .text.memcpy   0x00006f8c       0x7c libc/memory.o
+                0x00006f8c                memcpy
+ .text.memset   0x00007008       0x80 libc/memory.o
+                0x00007008                memset
+ .text.memcmp   0x00007088       0x3c libc/memory.o
+                0x00007088                memcmp
+ .text.strlen   0x000070c4       0x28 libc/string.o
+                0x000070c4                strlen
+ .text.strcmp   0x000070ec       0x44 libc/string.o
+                0x000070ec                strcmp
+ .text.strchr   0x00007130       0x2c libc/string.o
+                0x00007130                strchr
+ .text.isprint  0x0000715c        0xc libc/ctype.o
+                0x0000715c                isprint
+ .text.isspace  0x00007168       0x1c libc/ctype.o
+                0x00007168                isspace
+ .text.abs      0x00007184       0x10 libc/stdlib.o
+                0x00007184                abs
+ .text.qsort    0x00007194      0x370 libc/qsort.o
+                0x00007194                qsort
  .text.expf.part.0
-                0x00007524      0x20c libc/math.o
+                0x00007504      0x20c libc/math.o
  .text.logf.part.0
-                0x00007730      0x1c0 libc/math.o
- .text.sqrtf    0x000078f0      0x13c libc/math.o
-                0x000078f0                sqrtf
- .text.powf     0x00007a2c      0x29c libc/math.o
-                0x00007a2c                powf
- .text.cosf     0x00007cc8      0x1d8 libc/math.o
-                0x00007cc8                cosf
- .text.sinf     0x00007ea0      0x200 libc/math.o
-                0x00007ea0                sinf
- .text.sprintf  0x000080a0      0x234 libc/file.o
-                0x000080a0                sprintf
+                0x00007710      0x1c0 libc/math.o
+ .text.powf     0x000078d0      0x29c libc/math.o
+                0x000078d0                powf
+ .text.cosf     0x00007b6c      0x1d8 libc/math.o
+                0x00007b6c                cosf
+ .text.sinf     0x00007d44      0x200 libc/math.o
+                0x00007d44                sinf
+ .text.sprintf  0x00007f44      0x234 libc/file.o
+                0x00007f44                sprintf
  .text.__udivdi3
-                0x000082d4      0x42c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_udivdi3.o)
-                0x000082d4                __udivdi3
+                0x00008178      0x42c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_udivdi3.o)
+                0x00008178                __udivdi3
  .text.__adddf3
-                0x00008700      0x780 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(adddf3.o)
-                0x00008700                __adddf3
+                0x000085a4      0x780 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(adddf3.o)
+                0x000085a4                __adddf3
  .text.__divdf3
-                0x00008e80      0x6bc /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(divdf3.o)
-                0x00008e80                __divdf3
+                0x00008d24      0x6bc /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(divdf3.o)
+                0x00008d24                __divdf3
  .text.__fixdfsi
-                0x0000953c       0x80 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(fixdfsi.o)
-                0x0000953c                __fixdfsi
+                0x000093e0       0x80 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(fixdfsi.o)
+                0x000093e0                __fixdfsi
  .text.__addsf3
-                0x000095bc      0x430 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(addsf3.o)
-                0x000095bc                __addsf3
+                0x00009460      0x430 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(addsf3.o)
+                0x00009460                __addsf3
  .text.__divsf3
-                0x000099ec      0x31c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(divsf3.o)
-                0x000099ec                __divsf3
- .text.__eqsf2  0x00009d08       0x68 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(eqsf2.o)
-                0x00009d08                __nesf2
-                0x00009d08                __eqsf2
- .text.__gesf2  0x00009d70       0xa0 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(gesf2.o)
-                0x00009d70                __gtsf2
-                0x00009d70                __gesf2
- .text.__lesf2  0x00009e10       0xa0 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(lesf2.o)
-                0x00009e10                __lesf2
-                0x00009e10                __ltsf2
+                0x00009890      0x31c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(divsf3.o)
+                0x00009890                __divsf3
+ .text.__eqsf2  0x00009bac       0x68 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(eqsf2.o)
+                0x00009bac                __nesf2
+                0x00009bac                __eqsf2
+ .text.__gesf2  0x00009c14       0xa0 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(gesf2.o)
+                0x00009c14                __gtsf2
+                0x00009c14                __gesf2
+ .text.__lesf2  0x00009cb4       0xa0 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(lesf2.o)
+                0x00009cb4                __lesf2
+                0x00009cb4                __ltsf2
  .text.__mulsf3
-                0x00009eb0      0x31c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(mulsf3.o)
-                0x00009eb0                __mulsf3
+                0x00009d54      0x31c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(mulsf3.o)
+                0x00009d54                __mulsf3
  .text.__subsf3
-                0x0000a1cc      0x440 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(subsf3.o)
-                0x0000a1cc                __subsf3
+                0x0000a070      0x440 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(subsf3.o)
+                0x0000a070                __subsf3
  .text.__fixsfsi
-                0x0000a60c       0x70 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(fixsfsi.o)
-                0x0000a60c                __fixsfsi
+                0x0000a4b0       0x70 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(fixsfsi.o)
+                0x0000a4b0                __fixsfsi
  .text.__floatsisf
-                0x0000a67c      0x110 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(floatsisf.o)
-                0x0000a67c                __floatsisf
+                0x0000a520      0x110 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(floatsisf.o)
+                0x0000a520                __floatsisf
  .text.__floatunsisf
-                0x0000a78c       0xe4 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(floatunsisf.o)
-                0x0000a78c                __floatunsisf
+                0x0000a630       0xe4 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(floatunsisf.o)
+                0x0000a630                __floatunsisf
  .text.__floatdisf
-                0x0000a870      0x184 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(floatdisf.o)
-                0x0000a870                __floatdisf
+                0x0000a714      0x184 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(floatdisf.o)
+                0x0000a714                __floatdisf
  .text.__extendsfdf2
-                0x0000a9f4       0xec /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(extendsfdf2.o)
-                0x0000a9f4                __extendsfdf2
+                0x0000a898       0xec /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(extendsfdf2.o)
+                0x0000a898                __extendsfdf2
  .text.__lshrdi3
-                0x0000aae0       0x38 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_lshrdi3.o)
-                0x0000aae0                __lshrdi3
+                0x0000a984       0x38 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_lshrdi3.o)
+                0x0000a984                __lshrdi3
  .text.__ashldi3
-                0x0000ab18       0x38 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_ashldi3.o)
-                0x0000ab18                __ashldi3
+                0x0000a9bc       0x38 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_ashldi3.o)
+                0x0000a9bc                __ashldi3
  .text.__clzsi2
-                0x0000ab50       0x4c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_clzsi2.o)
-                0x0000ab50                __clzsi2
+                0x0000a9f4       0x4c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_clzsi2.o)
+                0x0000a9f4                __clzsi2
  *(.rodata*)
  .rodata.main.str1.4
-                0x0000ab9c      0xbf1 main.o
+                0x0000aa40      0xbf1 main.o
                                  0x42 (size before relaxing)
  .rodata.term_printf.str1.4
-                0x0000b78d       0x2d terminal.o
- *fill*         0x0000b78d        0x3 
+                0x0000b631       0x2d terminal.o
+ *fill*         0x0000b631        0x3 
  .rodata.term_printf
-                0x0000b790       0x84 terminal.o
+                0x0000b634       0x84 terminal.o
  .rodata.malloc_run_state.str1.4
-                0x0000b814       0x6e llama_embedded.o
+                0x0000b6b8       0x6e llama_embedded.o
  .rodata.get_or_load_tensor.constprop.0.str1.4
-                0x0000b814       0x25 llama_embedded.o
+                0x0000b6b8       0x25 llama_embedded.o
  .rodata.llama_main.str1.4
-                0x0000b814      0x867 llama_embedded.o
+                0x0000b6b8      0x867 llama_embedded.o
  .rodata.skip_gguf_value
-                0x0000b814       0x34 gguf.o
+                0x0000b6b8       0x34 gguf.o
  .rodata.gguf_init.str1.4
-                0x0000b848       0x60 gguf.o
+                0x0000b6ec       0x60 gguf.o
  .rodata.gguf_parse_metadata.str1.4
-                0x0000b848      0x231 gguf.o
- .rodata        0x0000b848       0x20 gguf.o
+                0x0000b6ec      0x231 gguf.o
+ *fill*         0x0000b6ec        0x4 
+ .rodata        0x0000b6f0       0x20 gguf.o
  .rodata.sprintf.str1.4
-                0x0000b868        0x7 libc/file.o
+                0x0000b710        0x7 libc/file.o
  .rodata.sprintf
-                0x0000b868       0x4c libc/file.o
+                0x0000b710       0x4c libc/file.o
  .rodata.__divdf3
-                0x0000b8b4       0x3c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(divdf3.o)
+                0x0000b75c       0x3c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(divdf3.o)
  .rodata.__divsf3
-                0x0000b8f0       0x3c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(divsf3.o)
+                0x0000b798       0x3c /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(divsf3.o)
  .rodata.__clz_tab
-                0x0000b92c      0x100 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_clz.o)
-                0x0000b92c                __clz_tab
-                0x0000c07c                        . = ALIGN (0x4)
-                0x0000ba2c                        __text_end = .
+                0x0000b7d4      0x100 /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a(_clz.o)
+                0x0000b7d4                __clz_tab
+                0x0000b8d4                        . = ALIGN (0x4)
+                0x0000b8d4                        __text_end = .
 
-.srodata.cst4   0x0000ba2c       0xb8
- .srodata.cst4  0x0000ba2c       0xb8 llama_embedded.o
-                                 0x4c (size before relaxing)
- .srodata.cst4  0x0000bae4       0x7c libc/math.o
+.srodata.cst4   0x0000b8d4       0xbc
+ .srodata.cst4  0x0000b8d4       0xbc llama_embedded.o
+                                 0x54 (size before relaxing)
+ .srodata.cst4  0x0000b990       0x7c libc/math.o
 
-.srodata.cst8   0x0000bae8       0x28
- .srodata.cst8  0x0000bae8       0x28 libc/math.o
+.srodata.cst8   0x0000b990       0x28
+ .srodata.cst8  0x0000b990       0x28 libc/math.o
 
-.rela.dyn       0x0000bb10        0x0
+.rela.dyn       0x0000b9b8        0x0
  .rela.text.start
-                0x0000bb10        0x0 main.o
+                0x0000b9b8        0x0 main.o
 
-.data           0x0000bb10        0xc
-                0x0000bb10                        __data_start = .
+.data           0x0000b9b8        0xc
+                0x0000b9b8                        __data_start = .
  *(.data*)
  *(.sdata*)
  .sdata.rope_last_pos
-                0x0000bb10        0x4 llama_embedded.o
+                0x0000b9b8        0x4 llama_embedded.o
  .sdata.psram_cache_ptr
-                0x0000bb14        0x4 llama_embedded.o
+                0x0000b9bc        0x4 llama_embedded.o
  .sdata.sdram_arena_ptr
-                0x0000bb18        0x4 llama_embedded.o
-                0x0000bb1c                        . = ALIGN (0x4)
-                0x0000bb1c                        __data_end = .
+                0x0000b9c0        0x4 llama_embedded.o
+                0x0000b9c4                        . = ALIGN (0x4)
+                0x0000b9c4                        __data_end = .
 
-.bss            0x0000bb20      0x3a8
-                0x0000bb20                        . = ALIGN (0x4)
-                0x0000bb20                        __bss_start = .
+.bss            0x0000b9c8      0x3a8
+                0x0000b9c8                        . = ALIGN (0x4)
+                0x0000b9c8                        __bss_start = .
  *(.bss*)
  .bss.decoded.0
-                0x0000bb20      0x100 llama_embedded.o
+                0x0000b9c8      0x100 llama_embedded.o
  .bss.decoded.1
-                0x0000bc20       0x80 llama_embedded.o
+                0x0000bac8       0x80 llama_embedded.o
  .bss.token_str.2
-                0x0000bca0       0x80 llama_embedded.o
+                0x0000bb48       0x80 llama_embedded.o
  .bss.g_gguf_ctx
-                0x0000bd20       0x70 llama_embedded.o
+                0x0000bbc8       0x70 llama_embedded.o
  .bss.encode_str_buffer
-                0x0000bd90      0x100 llama_embedded.o
+                0x0000bc38      0x100 llama_embedded.o
  *(.sbss*)
  .sbss.cursor_pos
-                0x0000be90        0x4 terminal.o
+                0x0000bd38        0x4 terminal.o
  .sbss.tok_string_ptr
-                0x0000be94        0x4 llama_embedded.o
+                0x0000bd3c        0x4 llama_embedded.o
  .sbss.tok_string_pool
-                0x0000be98        0x4 llama_embedded.o
+                0x0000bd40        0x4 llama_embedded.o
  .sbss.tok_scores_ptr
-                0x0000be9c        0x4 llama_embedded.o
+                0x0000bd44        0x4 llama_embedded.o
  .sbss.tok_vocab_ptrs
-                0x0000bea0        0x4 llama_embedded.o
+                0x0000bd48        0x4 llama_embedded.o
  .sbss.rope_freq_head_size
-                0x0000bea4        0x4 llama_embedded.o
+                0x0000bd4c        0x4 llama_embedded.o
  .sbss.rope_cos_cache
-                0x0000bea8        0x4 llama_embedded.o
+                0x0000bd50        0x4 llama_embedded.o
  .sbss.rope_sin_cache
-                0x0000beac        0x4 llama_embedded.o
+                0x0000bd54        0x4 llama_embedded.o
  .sbss.rope_freq_cache
-                0x0000beb0        0x4 llama_embedded.o
+                0x0000bd58        0x4 llama_embedded.o
  .sbss.k_sdram_batch
-                0x0000beb4        0x4 llama_embedded.o
+                0x0000bd5c        0x4 llama_embedded.o
  .sbss.x_sdram_buf
-                0x0000beb8        0x4 llama_embedded.o
+                0x0000bd60        0x4 llama_embedded.o
  .sbss.g_tokenizer
-                0x0000bebc        0x4 llama_embedded.o
-                0x0000bebc                g_tokenizer
+                0x0000bd64        0x4 llama_embedded.o
+                0x0000bd64                g_tokenizer
  .sbss.heap_end
-                0x0000bec0        0x4 libc/memory.o
+                0x0000bd68        0x4 libc/memory.o
  .sbss.heap_start
-                0x0000bec4        0x4 libc/memory.o
+                0x0000bd6c        0x4 libc/memory.o
  *(COMMON)
-                0x0000bec8                        . = ALIGN (0x4)
-                0x0000bec8                        __bss_end = .
-                0x0000bec8                        __ram_end = .
+                0x0000bd70                        . = ALIGN (0x4)
+                0x0000bd70                        __bss_end = .
+                0x0000bd70                        __ram_end = .
                 0x00010000                        __stack_top = (ORIGIN (RAM) + LENGTH (RAM))
 
 .heap           0x10000000  0x4000000
@@ -750,8 +750,8 @@ LOAD /usr/lib/gcc/riscv64-elf/14.1.0/rv32im/ilp32/libgcc.a
  *fill*         0x10000000  0x4000000 
                 0x14000000                        __heap_end = .
                 0x00010000                        PROVIDE (_stack_top = __stack_top)
-                0x0000bb20                        PROVIDE (_bss_start = __bss_start)
-                0x0000bec8                        PROVIDE (_bss_end = __bss_end)
+                0x0000b9c8                        PROVIDE (_bss_start = __bss_start)
+                0x0000bd70                        PROVIDE (_bss_end = __bss_end)
                 [!provide]                        PROVIDE (_heap_start = __sdram_base)
                 [!provide]                        PROVIDE (_heap_end = (__sdram_base + __sdram_size))
 OUTPUT(firmware.elf elf32-littleriscv)
