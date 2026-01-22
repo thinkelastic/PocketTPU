@@ -98,10 +98,11 @@ reg [9:0] fetch_idx;
 // Computation pipeline
 reg [9:0] comp_idx;
 
-// Pipeline registers for multiply-accumulate
-reg signed [31:0] op_a, op_b;
+// Pipeline registers for 2-way parallel multiply-accumulate
+reg signed [31:0] op_a0, op_a1;
+reg signed [31:0] op_b0, op_b1;
 reg pipe1_valid;
-reg signed [63:0] product;
+reg signed [63:0] prod0, prod1;
 reg pipe2_valid;
 
 // Use burst_32bit for 32-bit transfers
@@ -129,8 +130,9 @@ assign reg_rdata = rdata_comb;
 // Track if we've processed this access
 reg access_done;
 
-// Read from active buffer
-wire signed [31:0] vec_a_read = active_buf ? vec_a1[comp_idx] : vec_a0[comp_idx];
+// 2-way parallel reads from active buffer
+wire signed [31:0] vec_a_read0 = active_buf ? vec_a1[comp_idx]   : vec_a0[comp_idx];
+wire signed [31:0] vec_a_read1 = active_buf ? vec_a1[comp_idx+1] : vec_a0[comp_idx+1];
 
 // Main state machine
 always @(posedge clk or negedge reset_n) begin
@@ -158,9 +160,9 @@ always @(posedge clk or negedge reset_n) begin
         access_done <= 0;
         pipe1_valid <= 0;
         pipe2_valid <= 0;
-        op_a <= 0;
-        op_b <= 0;
-        product <= 0;
+        op_a0 <= 0; op_a1 <= 0;
+        op_b0 <= 0; op_b1 <= 0;
+        prod0 <= 0; prod1 <= 0;
     end else begin
         // Default: deassert burst_rd after one cycle
         burst_rd <= 0;
@@ -289,25 +291,29 @@ always @(posedge clk or negedge reset_n) begin
             end
 
             STATE_COMPUTE: begin
-                // Standard compute - no concurrent fetch
+                // 2-way parallel compute - no concurrent fetch
                 if (comp_idx < vec_length) begin
-                    op_a <= vec_a_read;
-                    op_b <= vec_b[comp_idx];
+                    // Read 2 elements in parallel
+                    op_a0 <= vec_a_read0; op_b0 <= vec_b[comp_idx];
+                    op_a1 <= vec_a_read1; op_b1 <= vec_b[comp_idx+1];
                     pipe1_valid <= 1;
-                    comp_idx <= comp_idx + 1;
+                    comp_idx <= comp_idx + 2;  // Process 2 elements per cycle
                 end else begin
                     pipe1_valid <= 0;
                 end
 
                 if (pipe1_valid) begin
-                    product <= op_a * op_b;
+                    // 2 parallel multiplies
+                    prod0 <= op_a0 * op_b0;
+                    prod1 <= op_a1 * op_b1;
                     pipe2_valid <= 1;
                 end else begin
                     pipe2_valid <= 0;
                 end
 
                 if (pipe2_valid) begin
-                    accumulator <= accumulator + product;
+                    // Sum both products and accumulate
+                    accumulator <= accumulator + prod0 + prod1;
                 end
 
                 if (comp_idx >= vec_length && !pipe1_valid && !pipe2_valid) begin
@@ -316,27 +322,31 @@ always @(posedge clk or negedge reset_n) begin
             end
 
             STATE_COMPUTE_FETCH: begin
-                // Concurrent compute + prefetch into other buffer
+                // Concurrent 2-way parallel compute + prefetch into other buffer
 
-                // Computation pipeline (same as STATE_COMPUTE)
+                // 2-way parallel computation pipeline
                 if (comp_idx < vec_length) begin
-                    op_a <= vec_a_read;
-                    op_b <= vec_b[comp_idx];
+                    // Read 2 elements in parallel
+                    op_a0 <= vec_a_read0; op_b0 <= vec_b[comp_idx];
+                    op_a1 <= vec_a_read1; op_b1 <= vec_b[comp_idx+1];
                     pipe1_valid <= 1;
-                    comp_idx <= comp_idx + 1;
+                    comp_idx <= comp_idx + 2;  // Process 2 elements per cycle
                 end else begin
                     pipe1_valid <= 0;
                 end
 
                 if (pipe1_valid) begin
-                    product <= op_a * op_b;
+                    // 2 parallel multiplies
+                    prod0 <= op_a0 * op_b0;
+                    prod1 <= op_a1 * op_b1;
                     pipe2_valid <= 1;
                 end else begin
                     pipe2_valid <= 0;
                 end
 
                 if (pipe2_valid) begin
-                    accumulator <= accumulator + product;
+                    // Sum both products and accumulate
+                    accumulator <= accumulator + prod0 + prod1;
                 end
 
                 // Start prefetch on first cycle

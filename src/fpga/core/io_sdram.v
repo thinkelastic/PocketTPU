@@ -157,6 +157,7 @@ synch_3 s3(word_wr, word_wr_s, controller_clk, word_wr_r);
     reg             enable_data_done, enable_data_done_1, enable_data_done_2, enable_data_done_3, enable_data_done_4;
 
     reg             read_newrow;
+    reg             read_cmd_issued;    // Full-page burst: track if READ issued for current row
     reg             burstwr_newrow;
     
     
@@ -238,7 +239,8 @@ always @(posedge controller_clk) begin
         delay_boot <= 0;
         issue_autorefresh <= 0;
         phy_dqm <= 2'b00;
-        
+        read_cmd_issued <= 0;
+
         state <= ST_BOOT_0;
     end
     ST_BOOT_0: begin
@@ -416,17 +418,17 @@ always @(posedge controller_clk) begin
         if(dc == TIMING_ACT_RW-1) begin
             dc <= 0;
             state <= ST_READ_2;
-        end 
+        end
     end
     ST_READ_2: begin
         phy_a <= addr[9:0]; // A0-A9 row address
         cmd <= CMD_READ;
-            
+
         enable_dq_read <= 1;
-        
+
         length <= length - 1'b1;
         addr <= addr + 1'b1;
-        
+
         if(length == 1) begin
             // we just read the last word, bail
             read_newrow <= 0;

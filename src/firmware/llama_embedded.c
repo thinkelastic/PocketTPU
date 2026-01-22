@@ -56,7 +56,7 @@ static void* psram_cache_alloc(size_t size) {
 }
 
 /* Configuration - adjust these for your model */
-#define DEFAULT_STEPS       1024     /* Max tokens to generate */
+#define DEFAULT_STEPS       64     /* Max tokens to generate */
 #define DEFAULT_TEMPERATURE 0.0f    /* 0 = greedy sampling (deterministic) */
 #define DEFAULT_TOPP        1.0f    /* 1 = disabled */
 #define DEFAULT_PROMPT      "Once upon a time"
@@ -660,16 +660,8 @@ static float* forward_gpt2(Transformer* transformer, int token, int pos) {
             float* q = s->q + h * head_size;
             float* att = s->att + h * p->seq_len;
 
-            /* Compute attention scores: Q @ K^T / sqrt(head_size) */
-            float scale = 1.0f / sqrtf((float)head_size);
-            for (int t = 0; t <= pos; t++) {
-                float* k = s->key_cache + loff + t * dim + h * head_size;
-                float score = 0.0f;
-                for (int i = 0; i < head_size; i++) {
-                    score += q[i] * k[i];
-                }
-                att[t] = score * scale;
-            }
+            /* Compute attention scores: Q @ K^T / sqrt(head_size) - use DMA accelerator */
+            accel_attention_scores(att, q, s->key_cache + loff, pos, head_size, dim, h * head_size);
 
             softmax(att, pos + 1);
 
@@ -945,6 +937,7 @@ static int parse_byte_token(const char *s, unsigned char *out) {
 }
 
 static char* decode(Tokenizer* t, int prev_token, int token) {
+    static char decoded[256];
     /* Bounds check */
     if (token < 0 || token >= t->vocab_size) {
         return "(BAD)";
@@ -960,7 +953,25 @@ static char* decode(Tokenizer* t, int prev_token, int token) {
     if (parse_byte_token(piece, &byte_val)) {
         piece = (char*)t->byte_pieces + byte_val * 2;
     }
-    return piece;
+
+    /* GPT-2 BPE uses special byte encoding:
+     * - Ġ (U+0120, UTF-8: 0xC4 0xA0) represents space
+     * - Ċ (U+010A, UTF-8: 0xC4 0x8A) represents newline */
+    int j = 0;
+    for (int i = 0; piece[i] && j < (int)sizeof(decoded) - 1; i++) {
+        unsigned char c = (unsigned char)piece[i];
+        if (c == 0xC4 && (unsigned char)piece[i+1] == 0xA0) {
+            decoded[j++] = ' ';  /* Ġ -> space */
+            i++;
+        } else if (c == 0xC4 && (unsigned char)piece[i+1] == 0x8A) {
+            decoded[j++] = '\n'; /* Ċ -> newline */
+            i++;
+        } else {
+            decoded[j++] = piece[i];
+        }
+    }
+    decoded[j] = '\0';
+    return decoded;
 }
 
 static void safe_printf(char *piece) {
@@ -1228,11 +1239,14 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
         }
         pos++;
 
-        if (next == 1) { break; }
+        if (next == 1) { break; }  /* EOS token */
 
         char* piece = decode(tokenizer, token, next);
         safe_printf(piece);
         token = next;
+
+        /* Stop on newline */
+        if (piece && strchr(piece, '\n')) { break; }
 
         if (start_cycles == 0) {
             /* Start timing after first token (prompt processing) */
