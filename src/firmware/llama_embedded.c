@@ -411,6 +411,9 @@ static void softmax(float* x, int size) {
 /* Flag to track if weights have been converted */
 static int weights_converted = 0;
 
+/* Number of layers with wo weights cached in BRAM (0 = none) */
+static int wo_cached_layers = 0;
+
 /* Convert model weights from float to Q16.16 in-place.
  * Call once at startup before inference. */
 static void convert_weights_to_q16(float* weights, size_t num_floats) {
@@ -566,6 +569,27 @@ static void matmul_batch(float* xout, float* w, int n, int d) {
             int64_t result = dma_dot_product_q16(wi, x_sdram_buf, n);
             xout[i] = Q32_TO_FLOAT(result);
         }
+    }
+}
+
+/*
+ * Matmul using BRAM weight cache.
+ * Weights must have been loaded with dma_cache_load().
+ * x must have been preloaded with matmul_batch_begin().
+ * For small matrices (dim*dim <= 4096), uses single cache slot per layer.
+ */
+static void matmul_cached(float* xout, int cache_slot, int n, int d) {
+    dma_cache_select(cache_slot);
+    dma_dot_set_length(n);
+
+    /* Compute each row using cached weights and cached B */
+    for (int i = 0; i < d; i++) {
+        /* Set row offset: row i starts at i*n within the cache slot */
+        dma_cache_set_row_offset(i * n);
+        dma_dot_start_cached_weights();
+        dma_dot_wait();
+        int64_t result = dma_dot_get_result();
+        xout[i] = Q32_TO_FLOAT(result);
     }
 }
 
@@ -828,8 +852,17 @@ static float* forward_gpt2(Transformer* transformer, int token, int pos) {
         }
 
         /* Output projection */
-        float* wo_l = w->wo_layer[l] ? w->wo_layer[l] : (w->wo + l*dim*dim);
-        matmul(s->xb2, s->xb, wo_l, dim, dim);
+#if USE_DMA_ACCEL
+        if (l < wo_cached_layers) {
+            /* Use BRAM-cached weights for faster matmul */
+            matmul_batch_begin(s->xb, dim);
+            matmul_cached(s->xb2, l, dim, dim);
+        } else
+#endif
+        {
+            float* wo_l = w->wo_layer[l] ? w->wo_layer[l] : (w->wo + l*dim*dim);
+            matmul(s->xb2, s->xb, wo_l, dim, dim);
+        }
         /* Add bias */
         for (int i = 0; i < dim; i++) {
             s->xb2[i] += w->wo_bias[l*dim + i];
@@ -2029,6 +2062,12 @@ void llama_main(void) {
         }
 
         weights_converted = 1;
+
+        /* BRAM weight cache - currently disabled
+         * Single cache slot (16KB) can hold one 64x64 matrix.
+         * Per-layer reload adds too much overhead.
+         * TODO: Increase cache size once async reads work with M10K */
+        wo_cached_layers = 0;
     }
 
 #endif

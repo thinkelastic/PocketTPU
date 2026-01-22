@@ -84,6 +84,9 @@ localparam STATE_COMPUTE        = 4'd5;
 localparam STATE_DONE           = 4'd6;
 localparam STATE_COMPUTE_FETCH  = 4'd7;  // Compute while fetching next A
 localparam STATE_WAIT_PREFETCH  = 4'd8;  // Wait for prefetch to complete
+localparam STATE_CACHE_LOAD     = 4'd9;  // Start DMA for cache load
+localparam STATE_CACHE_WAIT     = 4'd10; // Wait for cache load to complete
+localparam STATE_CACHE_PRIME    = 4'd11; // Prime cache read pipeline (1 cycle delay)
 
 reg [3:0] state;
 
@@ -91,6 +94,24 @@ reg [3:0] state;
 reg signed [31:0] vec_a0 [0:MAX_LENGTH-1];
 reg signed [31:0] vec_a1 [0:MAX_LENGTH-1];
 reg signed [31:0] vec_b [0:MAX_LENGTH-1];
+
+// ==========================================================================
+// BRAM Weight Cache - 1 slot x 4096 elements = 16 KB
+// Caches one layer's output projection weights (64x64 = 4096 elements)
+// ==========================================================================
+parameter CACHE_SLOTS = 1;
+parameter CACHE_SLOT_SIZE = 4096;
+(* ramstyle = "M10K" *) reg signed [31:0] weight_cache [0:CACHE_SLOT_SIZE-1];
+
+// Cache control registers
+reg [3:0] cache_slot;               // Active slot (0-15)
+reg cache_load_busy;                // Loading in progress
+reg [23:0] cache_sdram_addr;        // SDRAM source address for loading
+reg [11:0] cache_load_length;       // Elements to load (up to 4096)
+reg [11:0] cache_write_idx;         // Write index during load
+reg use_weight_cache;               // Use cache instead of SDRAM for A
+reg [15:0] cache_slot_valid;        // Bitmask of valid slots
+reg [11:0] cache_row_offset;        // Row offset within cache slot (for matmul)
 
 // Fetch counters
 reg [9:0] fetch_idx;
@@ -122,6 +143,12 @@ always @(*) begin
         6'h04: rdata_comb = {8'b0, addr_a};         // ADDR_A
         6'h05: rdata_comb = {8'b0, addr_b};         // ADDR_B
         6'h06: rdata_comb = {8'b0, addr_a_next};    // ADDR_A_NEXT
+        // Cache registers (0x20-0x30)
+        6'h08: rdata_comb = {27'b0, cache_load_busy, cache_slot};  // 0x20 CACHE_CTRL
+        6'h09: rdata_comb = cache_slot_valid;       // 0x24 CACHE_VALID
+        6'h0A: rdata_comb = {8'b0, cache_sdram_addr}; // 0x28 CACHE_ADDR
+        6'h0B: rdata_comb = {20'b0, cache_load_length}; // 0x2C CACHE_LEN
+        6'h0C: rdata_comb = {20'b0, cache_row_offset}; // 0x30 CACHE_ROW_OFFSET
         default: rdata_comb = 32'h0;
     endcase
 end
@@ -133,6 +160,15 @@ reg access_done;
 // 2-way parallel reads from active buffer
 wire signed [31:0] vec_a_read0 = active_buf ? vec_a1[comp_idx]   : vec_a0[comp_idx];
 wire signed [31:0] vec_a_read1 = active_buf ? vec_a1[comp_idx+1] : vec_a0[comp_idx+1];
+
+// Cache read - synchronous for M10K inference
+// Address is combinational (fast), data is registered (1-cycle latency)
+wire [11:0] cache_read_addr = cache_row_offset + {2'b0, comp_idx};
+reg signed [31:0] cache_read0_reg, cache_read1_reg;
+
+// Select weight source: cache or DMA buffer
+wire signed [31:0] weight_val0 = use_weight_cache ? cache_read0_reg : vec_a_read0;
+wire signed [31:0] weight_val1 = use_weight_cache ? cache_read1_reg : vec_a_read1;
 
 // Main state machine
 always @(posedge clk or negedge reset_n) begin
@@ -163,9 +199,25 @@ always @(posedge clk or negedge reset_n) begin
         op_a0 <= 0; op_a1 <= 0;
         op_b0 <= 0; op_b1 <= 0;
         prod0 <= 0; prod1 <= 0;
+        // Cache registers
+        cache_slot <= 0;
+        cache_load_busy <= 0;
+        cache_sdram_addr <= 0;
+        cache_load_length <= 0;
+        cache_write_idx <= 0;
+        use_weight_cache <= 0;
+        cache_slot_valid <= 0;
+        cache_row_offset <= 0;
+        cache_read0_reg <= 0;
+        cache_read1_reg <= 0;
     end else begin
         // Default: deassert burst_rd after one cycle
         burst_rd <= 0;
+
+        // Synchronous cache read (required for M10K block RAM inference)
+        // Address is combinational, data is registered with 1-cycle latency
+        cache_read0_reg <= weight_cache[cache_read_addr];
+        cache_read1_reg <= weight_cache[cache_read_addr + 1];
 
         // Clear access_done when valid goes low
         if (!reg_valid) begin
@@ -184,6 +236,7 @@ always @(posedge clk or negedge reset_n) begin
                         use_cached_b <= reg_wdata[1];
                         preload_b_only <= reg_wdata[2];
                         pipeline_mode <= reg_wdata[3];
+                        use_weight_cache <= reg_wdata[4];  // Bit 4: use BRAM weight cache
                         accumulator <= 0;
                         fetch_idx <= 0;
                         comp_idx <= 0;
@@ -194,6 +247,15 @@ always @(posedge clk or negedge reset_n) begin
                             // Preload B only
                             state <= STATE_FETCH_B;
                             cached_b_length <= vec_length;
+                        end else if (reg_wdata[4] && cache_slot_valid[0]) begin
+                            // Use weight cache - skip SDRAM A fetch
+                            if (reg_wdata[1]) begin
+                                // Use cached B too - go to cache prime then compute
+                                state <= STATE_CACHE_PRIME;
+                            end else begin
+                                // Need to fetch B first
+                                state <= STATE_FETCH_B;
+                            end
                         end else if (prefetch_done) begin
                             // Have prefetched data - switch buffers and compute
                             active_buf <= ~active_buf;
@@ -215,6 +277,19 @@ always @(posedge clk or negedge reset_n) begin
                 6'h04: addr_a <= reg_wdata[23:0];
                 6'h05: addr_b <= reg_wdata[23:0];
                 6'h06: addr_a_next <= reg_wdata[23:0];
+                // Cache registers (0x20-0x2C)
+                6'h08: begin  // CACHE_CTRL - start load or select slot
+                    cache_slot <= reg_wdata[3:0];
+                    if (reg_wdata[8] && !cache_load_busy && !busy) begin
+                        // Bit 8: start cache load
+                        cache_load_busy <= 1;
+                        cache_write_idx <= 0;
+                        state <= STATE_CACHE_LOAD;
+                    end
+                end
+                6'h0A: cache_sdram_addr <= reg_wdata[23:0];
+                6'h0B: cache_load_length <= reg_wdata[11:0];
+                6'h0C: cache_row_offset <= reg_wdata[11:0];  // Row offset for matmul
                 default: ;
             endcase
         end
@@ -281,6 +356,12 @@ always @(posedge clk or negedge reset_n) begin
                 if (burst_data_done) begin
                     if (preload_b_only) begin
                         state <= STATE_DONE;
+                    end else if (use_weight_cache) begin
+                        // Go to cache prime to handle 1-cycle read latency
+                        state <= STATE_CACHE_PRIME;
+                        comp_idx <= 0;
+                        pipe1_valid <= 0;
+                        pipe2_valid <= 0;
                     end else begin
                         state <= STATE_COMPUTE;
                         comp_idx <= 0;
@@ -291,10 +372,10 @@ always @(posedge clk or negedge reset_n) begin
             end
 
             STATE_COMPUTE: begin
-                // 2-way parallel computation from vec_a buffers
+                // 2-way parallel computation from vec_a buffers or weight cache
                 if (comp_idx < vec_length) begin
-                    op_a0 <= vec_a_read0; op_b0 <= vec_b[comp_idx];
-                    op_a1 <= vec_a_read1; op_b1 <= vec_b[comp_idx+1];
+                    op_a0 <= weight_val0; op_b0 <= vec_b[comp_idx];
+                    op_a1 <= weight_val1; op_b1 <= vec_b[comp_idx+1];
                     pipe1_valid <= 1;
                     comp_idx <= comp_idx + 2;
                 end else begin
@@ -326,9 +407,9 @@ always @(posedge clk or negedge reset_n) begin
 
                 // 2-way parallel computation pipeline
                 if (comp_idx < vec_length) begin
-                    // Read 2 elements in parallel from active buffer
-                    op_a0 <= vec_a_read0; op_b0 <= vec_b[comp_idx];
-                    op_a1 <= vec_a_read1; op_b1 <= vec_b[comp_idx+1];
+                    // Read 2 elements in parallel from weight cache or active buffer
+                    op_a0 <= weight_val0; op_b0 <= vec_b[comp_idx];
+                    op_a1 <= weight_val1; op_b1 <= vec_b[comp_idx+1];
                     pipe1_valid <= 1;
                     comp_idx <= comp_idx + 2;  // Process 2 elements per cycle
                 end else begin
@@ -397,6 +478,44 @@ always @(posedge clk or negedge reset_n) begin
                     prefetch_done <= 1;
                     ready_for_next <= 1;
                     state <= STATE_DONE;
+                end
+            end
+
+            // ==========================================================================
+            // Cache States
+            // ==========================================================================
+
+            // Prime cache read pipeline (1 cycle to fill read registers)
+            STATE_CACHE_PRIME: begin
+                // Cache read is happening this cycle (combinational address)
+                // Next cycle, cache_read0/1_reg will have valid data
+                // Transition to compute - first compute cycle will use correct data
+                state <= STATE_COMPUTE;
+                comp_idx <= 0;
+                pipe1_valid <= 0;
+                pipe2_valid <= 0;
+            end
+
+            STATE_CACHE_LOAD: begin
+                // Start DMA burst read from SDRAM into weight cache
+                burst_rd <= 1;
+                burst_addr <= {cache_sdram_addr, 1'b0};  // Convert to byte address
+                burst_len <= {cache_load_length, 1'b0};  // Convert to 16-bit words
+                cache_write_idx <= 0;
+                state <= STATE_CACHE_WAIT;
+            end
+
+            STATE_CACHE_WAIT: begin
+                // Store incoming data into weight cache
+                if (burst_data_valid) begin
+                    weight_cache[cache_write_idx] <= burst_data;
+                    cache_write_idx <= cache_write_idx + 1;
+                end
+                if (burst_data_done) begin
+                    // Mark slot as valid
+                    cache_slot_valid[cache_slot] <= 1;
+                    cache_load_busy <= 0;
+                    state <= STATE_IDLE;
                 end
             end
 

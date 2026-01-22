@@ -9,6 +9,7 @@ A RISC-V core for the Analogue Pocket FPGA capable of running LLM inference for 
 - **GGUF Model Support** - Load models in GGUF format directly
 - **DMA Dot Product Accelerator** - Hardware DSP-based matmul with double-buffering
 - **8-Element DSP Accelerator** - Dedicated hardware for attention computation
+- **BRAM Weight Cache** - 16KB on-chip cache for frequently-used weights
 - **64KB BRAM** - Program and data storage
 - **64MB SDRAM** - External memory for model weights
 - **16MB PSRAM** - Fast KV cache storage
@@ -20,9 +21,72 @@ A RISC-V core for the Analogue Pocket FPGA capable of running LLM inference for 
 |--------------|-------|
 | Software only | ~24 tok/min |
 | DMA accelerator | ~150 tok/min |
-| DMA + optimizations | ~225 tok/min |
+| DMA + B-caching | ~225 tok/min |
+| DMA + optimizations | ~255 tok/min |
 
 Tested with TinyStories GPT-2 model (dim=64, 6 layers, 1M parameters).
+
+## Architecture
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                          Analogue Pocket FPGA                             │
+│                        (Cyclone V 5CEBA4F23C8)                            │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌──────────────────┐    ┌─────────────────────────────────────────────┐  │
+│  │   VexRiscv CPU   │    │              Memory Subsystem               │  │
+│  │   RV32IM 50MHz   │    │                                             │  │
+│  │                  │    │  ┌─────────┐  ┌─────────┐  ┌─────────────┐  │  │
+│  │  ┌────┐  ┌────┐  │    │  │  BRAM   │  │  SDRAM  │  │   PSRAM     │  │  │
+│  │  │ I$ │  │ D$ │  │    │  │  64KB   │  │  64MB   │  │   16MB      │  │  │
+│  │  └────┘  └────┘  │    │  │Firmware │  │ Weights │  │  KV Cache   │  │  │
+│  └────────┬─────────┘    │  └─────────┘  └────┬────┘  └─────────────┘  │  │
+│           │              │                    │                        │  │
+│           │ Bus          └────────────────────┼────────────────────────┘  │
+│           │                                   │                           │
+│  ┌────────┴───────────────────────────────────┴───────────────────────┐   │
+│  │                         Wishbone Bus                               │   │
+│  └────────┬───────────────────┬───────────────────┬───────────────────┘   │
+│           │                   │                   │                       │
+│  ┌────────┴────────┐ ┌────────┴────────┐ ┌────────┴────────┐              │
+│  │  DMA Dot Prod   │ │  8-Element DSP  │ │  Text Terminal  │              │
+│  │   Accelerator   │ │   Accelerator   │ │     40x30       │              │
+│  │                 │ │                 │ │                 │              │
+│  │ ┌─────────────┐ │ │ ┌─────────────┐ │ │ ┌─────────────┐ │              │
+│  │ │Weight Cache │ │ │ │ 8 DSP Mults │ │ │ │  Font ROM   │ │              │
+│  │ │    16KB     │ │ │ │  Parallel   │ │ │ │    8x8      │ │              │
+│  │ └─────────────┘ │ │ └─────────────┘ │ │ └─────────────┘ │              │
+│  │ ┌─────────────┐ │ │ ┌─────────────┐ │ │ ┌─────────────┐ │              │
+│  │ │ 2x DMA Bufs │ │ │ │ Adder Tree  │ │ │ │    VRAM     │ │              │
+│  │ │ 512 x 32bit │ │ │ │  Pipelined  │ │ │ │   1.2KB     │ │              │
+│  │ └─────────────┘ │ │ └─────────────┘ │ │ └─────────────┘ │              │
+│  │ ┌─────────────┐ │ │                 │ │                 │              │
+│  │ │ 2-way MAC   │ │ │  Q16.16 I/O     │ │  720x480 Video  │              │
+│  │ │  Pipeline   │ │ │  ~5 cycles      │ │                 │              │
+│  │ └─────────────┘ │ │                 │ │                 │              │
+│  │  0x50000000     │ │  0x51000000     │ │  0x20000000     │              │
+│  └─────────────────┘ └─────────────────┘ └─────────────────┘              │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+
+                            Data Flow During Inference
+
+┌──────────┐           ┌──────────┐           ┌──────────┐
+│  SDRAM   │───DMA────>│  Weight  │───MAC────>│  Result  │
+│ Weights  │           │  Buffer  │           │  Accum   │
+└──────────┘           └──────────┘           └──────────┘
+                            ▲
+┌──────────┐                │
+│  SDRAM   │───DMA──────────┘
+│  Input   │  (B-cached)
+└──────────┘
+
+┌──────────┐           ┌──────────┐           ┌──────────┐
+│  PSRAM   │───CPU────>│   Dot8   │──────────>│ Attention│
+│ KV Cache │           │  Accel   │           │  Scores  │
+└──────────┘           └──────────┘           └──────────┘
+```
 
 ## Quick Start
 
@@ -69,9 +133,10 @@ Tested with TinyStories GPT-2 model (dim=64, 6 layers, 1M parameters).
 
 | Resource | Used | Available | Utilization |
 |----------|------|-----------|-------------|
-| ALMs | 13,712 | 18,480 | 74% |
-| Registers | 25,572 | - | - |
-| Block Memory | 646 KB | 3,154 KB | 20% |
+| ALMs | 13,662 | 18,480 | 74% |
+| Registers | 25,683 | - | - |
+| Block Memory | 908 KB | 3,154 KB | 29% |
+| RAM Blocks | 116 | 308 | 38% |
 | DSP Blocks | 34 | 66 | 52% |
 
 ### Memory Map
@@ -93,6 +158,7 @@ Hardware accelerator for matrix-vector multiplication with DMA from SDRAM.
 
 - **Double-buffered DMA** - Overlaps memory transfer with computation
 - **B-caching** - Preload input vector, reuse for all weight rows
+- **Weight Cache** - 16KB BRAM cache for frequently-used weights
 - **2-way parallel MAC** - Process 2 elements per cycle
 - **Q16.16 fixed-point** - Weights pre-converted for fast computation
 - **512-element vectors** - Large batch support
@@ -101,13 +167,18 @@ Hardware accelerator for matrix-vector multiplication with DMA from SDRAM.
 
 | Offset | Register | Description |
 |--------|----------|-------------|
-| 0x00 | CTRL | [0]=start, [1]=use_cached_b, [2]=preload_b, [3]=pipeline |
+| 0x00 | CTRL | [0]=start, [1]=use_cached_b, [2]=preload_b, [3]=pipeline, [4]=use_cache |
 | 0x04 | LENGTH | Vector length (up to 512) |
 | 0x08 | RESULT_LO | Result bits [31:0] |
 | 0x0C | RESULT_HI | Result bits [63:32] |
 | 0x10 | ADDR_A | SDRAM address for weights |
 | 0x14 | ADDR_B | SDRAM address for input |
 | 0x18 | ADDR_A_NEXT | Next address for pipelining |
+| 0x20 | CACHE_CTRL | [3:0]=slot, [4]=busy, [8]=start_load |
+| 0x24 | CACHE_VALID | [15:0]=slot valid bitmask |
+| 0x28 | CACHE_ADDR | SDRAM source for cache load |
+| 0x2C | CACHE_LEN | Elements to load (up to 4096) |
+| 0x30 | CACHE_OFFSET | Row offset within cache slot |
 
 ## 8-Element DSP Accelerator
 
@@ -134,6 +205,7 @@ Dedicated hardware for head_size=8 attention dot products.
 ### GGUF Format (Recommended)
 
 - TinyStories GPT-2 models
+- TinyLlama models (with SentencePiece tokenizer)
 - Custom GGUF models with GPT-2 or LLaMA architecture
 
 ### Model Requirements
@@ -175,7 +247,7 @@ make clean all
 
 ```bash
 cd src/fpga
-make build      # Full compilation
+make build      # Full compilation (~6 min)
 make quick      # Update firmware only (fast)
 make program    # Program via JTAG
 ```

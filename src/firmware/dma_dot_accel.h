@@ -21,8 +21,19 @@
 #define DMA_DOT_ADDR_B    (DMA_DOT_ACCEL_BASE + 0x14)
 #define DMA_DOT_ADDR_A_NEXT (DMA_DOT_ACCEL_BASE + 0x18)
 
+// Weight cache registers
+#define DMA_DOT_CACHE_CTRL   (DMA_DOT_ACCEL_BASE + 0x20)  // [3:0]=slot, [8]=start_load
+#define DMA_DOT_CACHE_VALID  (DMA_DOT_ACCEL_BASE + 0x24)  // [15:0]=slot valid bitmask
+#define DMA_DOT_CACHE_ADDR   (DMA_DOT_ACCEL_BASE + 0x28)  // SDRAM source address
+#define DMA_DOT_CACHE_LEN    (DMA_DOT_ACCEL_BASE + 0x2C)  // Elements to load (up to 4096)
+#define DMA_DOT_CACHE_OFFSET (DMA_DOT_ACCEL_BASE + 0x30)  // Row offset within cache slot
+
 // Maximum vector size per batch (increased to 512 for B-caching optimization)
 #define DMA_DOT_MAX_LEN   512
+
+// Weight cache constants
+#define DMA_CACHE_SLOTS       16
+#define DMA_CACHE_SLOT_SIZE   4096  // Max elements per slot
 
 // Memory-mapped register access
 #define REG32(addr) (*(volatile uint32_t *)(addr))
@@ -61,6 +72,7 @@ static inline void dma_dot_wait(void) {
 #define DMA_DOT_CTRL_USE_CACHED  (1 << 1)  // Use cached B vector
 #define DMA_DOT_CTRL_PRELOAD_B   (1 << 2)  // Preload B only, no compute
 #define DMA_DOT_CTRL_PIPELINE    (1 << 3)  // Pipeline mode: prefetch next A while computing
+#define DMA_DOT_CTRL_USE_CACHE   (1 << 4)  // Use BRAM weight cache for A (skip SDRAM fetch)
 
 // Status register bits (read from CTRL)
 #define DMA_DOT_STATUS_BUSY      (1 << 0)  // Accelerator is busy
@@ -232,6 +244,119 @@ static inline int64_t dma_dot_pipeline_next(int32_t* a_next, int n) {
  * No more prefetching needed.
  */
 static inline int64_t dma_dot_pipeline_last(void) {
+    dma_dot_wait();
+    return dma_dot_get_result();
+}
+
+/*
+ * ============================================================================
+ * BRAM WEIGHT CACHE API
+ * ============================================================================
+ * For maximum throughput on frequently-used weights, load them into BRAM once
+ * at startup. Cache provides single-cycle access vs ~100+ cycle SDRAM DMA.
+ *
+ * Usage:
+ * 1. dma_cache_load(slot, weights_ptr, n)  - Load weights into cache slot
+ * 2. dma_cache_select(slot)                - Select active slot
+ * 3. dma_dot_start_cached_weights()        - Compute using cached weights + cached B
+ */
+
+// Check if cache load is in progress
+static inline int dma_cache_busy(void) {
+    return REG32(DMA_DOT_CACHE_CTRL) & (1 << 4);  // Bit 4 = cache_load_busy
+}
+
+// Wait for cache load to complete
+static inline void dma_cache_wait(void) {
+    while (dma_cache_busy());
+}
+
+// Get bitmask of valid cache slots
+static inline uint16_t dma_cache_get_valid(void) {
+    return REG32(DMA_DOT_CACHE_VALID) & 0xFFFF;
+}
+
+// Select active cache slot (0-15)
+static inline void dma_cache_select(int slot) {
+    REG32(DMA_DOT_CACHE_CTRL) = slot & 0xF;
+}
+
+// Set row offset within cache slot (for matmul: row * n)
+static inline void dma_cache_set_row_offset(int offset) {
+    REG32(DMA_DOT_CACHE_OFFSET) = offset & 0xFFF;
+}
+
+/*
+ * Load weights from SDRAM into cache slot.
+ * Blocks until load is complete.
+ *
+ * Parameters:
+ *   slot: Cache slot (0-15)
+ *   src:  Pointer to weights in SDRAM (Q16.16 format)
+ *   n:    Number of elements (up to 4096)
+ */
+static inline void dma_cache_load(int slot, int32_t* src, int n) {
+    // Wait for any previous operation to complete
+    dma_dot_wait();
+    dma_cache_wait();
+
+    // Set source address and length
+    REG32(DMA_DOT_CACHE_ADDR) = ptr_to_sdram_word_addr(src);
+    REG32(DMA_DOT_CACHE_LEN) = n;
+
+    // Start load: slot in [3:0], start bit in [8]
+    REG32(DMA_DOT_CACHE_CTRL) = (slot & 0xF) | (1 << 8);
+
+    // Wait for load to complete
+    dma_cache_wait();
+}
+
+/*
+ * Start computation using cached weights (from BRAM) and cached B vector.
+ * Much faster than SDRAM path - weights read in single cycle.
+ * Must have called dma_cache_select() to choose slot first.
+ */
+static inline void dma_dot_start_cached_weights(void) {
+    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_USE_CACHED | DMA_DOT_CTRL_USE_CACHE;
+}
+
+/*
+ * Compute dot product using cached weights from BRAM.
+ * B vector fetched from SDRAM (normal path).
+ * Weights must have been loaded with dma_cache_load().
+ *
+ * Parameters:
+ *   slot: Cache slot containing weights (0-15)
+ *   b:    Pointer to B vector in SDRAM (Q16.16 format)
+ *   n:    Number of elements
+ *
+ * Returns: 64-bit Q32.32 result
+ */
+static inline int64_t dma_dot_product_cached_weights(int slot, int32_t* b, int n) {
+    dma_cache_select(slot);
+    dma_dot_set_addr_b(ptr_to_sdram_word_addr(b));
+    dma_dot_set_length(n);
+    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_USE_CACHE;
+    dma_dot_wait();
+    return dma_dot_get_result();
+}
+
+/*
+ * Compute dot product using both cached weights (BRAM) and cached B vector.
+ * Fastest path - no SDRAM access during compute.
+ * B must have been preloaded with dma_dot_preload_b_vector().
+ * Weights must have been loaded with dma_cache_load().
+ *
+ * Parameters:
+ *   slot: Cache slot containing weights (0-15)
+ *   n:    Number of elements
+ *
+ * Returns: 64-bit Q32.32 result
+ */
+static inline int64_t dma_dot_product_full_cached(int slot, int n) {
+    dma_cache_select(slot);
+    dma_dot_set_length(n);
+    dma_dot_start_cached_weights();
     dma_dot_wait();
     return dma_dot_get_result();
 }
