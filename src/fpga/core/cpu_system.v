@@ -45,7 +45,7 @@ module cpu_system (
     // DMA accelerator register interface (directly exposed to core_top)
     output wire        accel_reg_valid,
     output wire        accel_reg_write,
-    output wire [7:0]  accel_reg_addr,
+    output wire [23:0] accel_reg_addr,  // Expanded to 24 bits for multiple accelerators
     output wire [31:0] accel_reg_wdata,
     input wire  [31:0] accel_reg_rdata,
     input wire         accel_reg_ready
@@ -148,7 +148,8 @@ wire        mem_write = dbus_grant & dbus_we;
 // 0x20000000 - 0x20001FFF : Terminal VRAM
 // 0x30000000 - 0x30FFFFFF : PSRAM (16MB) - heap
 // 0x40000000 - 0x400000FF : System registers
-// 0x50000000 - 0x500000FF : Dot product accelerator
+// 0x50000000 - 0x500000FF : DMA Dot product accelerator
+// 0x51000000 - 0x510000FF : 8-element DSP dot product accelerator
 
 // Decode memory regions
 wire ram_select    = (mem_addr[31:16] == 16'b0);                    // 0x00000000-0x0000FFFF (64KB)
@@ -156,7 +157,7 @@ wire sdram_select  = (mem_addr[31:26] == 6'b000100);                // 0x1000000
 wire term_select   = (mem_addr[31:13] == 19'h10000);                // 0x20000000-0x20001FFF
 wire psram_select  = (mem_addr[31:24] == 8'h30);                    // 0x30000000-0x30FFFFFF (16MB)
 wire sysreg_select = (mem_addr[31:8] == 24'h400000);                // 0x40000000-0x400000FF
-wire accel_select  = (mem_addr[31:8] == 24'h500000);                // 0x50000000-0x500000FF (dot product accelerator)
+wire accel_select  = (mem_addr[31:24] == 8'h50);                    // 0x50000000-0x50FFFFFF (accelerators)
 
 // ============================================
 // RAM using block RAM (64KB = 16384 x 32-bit words)
@@ -216,7 +217,7 @@ assign term_mem_wstrb = mem_wstrb;
 // access to the SDRAM burst interface. We just expose the register interface here.
 assign accel_reg_valid = mem_valid && accel_select;
 assign accel_reg_write = mem_write;
-assign accel_reg_addr = mem_addr[7:0];
+assign accel_reg_addr = mem_addr[23:0];  // Full address for accelerator selection
 assign accel_reg_wdata = mem_wdata;
 
 wire [31:0] accel_rdata = accel_reg_rdata;

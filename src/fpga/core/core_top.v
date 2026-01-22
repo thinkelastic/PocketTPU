@@ -775,13 +775,31 @@ assign video_hs = vidout_hs;
     wire [31:0] term_mem_rdata;
     wire        term_mem_ready;
 
-    // DMA accelerator register interface signals
+    // Accelerator register interface signals (expanded for multiple accelerators)
     wire        accel_reg_valid;
     wire        accel_reg_write;
-    wire [7:0]  accel_reg_addr;
+    wire [23:0] accel_reg_addr;  // 24 bits: [23:16]=accelerator select, [7:0]=register
     wire [31:0] accel_reg_wdata;
     wire [31:0] accel_reg_rdata;
     wire        accel_reg_ready;
+
+    // Accelerator address decoding
+    wire dma_accel_select  = (accel_reg_addr[23:16] == 8'h00);  // 0x50000000
+    wire dot8_accel_select = (accel_reg_addr[23:16] == 8'h01);  // 0x51000000
+
+    // DMA Dot Product Accelerator signals
+    wire [31:0] dma_accel_rdata;
+    wire        dma_accel_ready;
+
+    // 8-element DSP Dot Product Accelerator signals
+    wire [31:0] dot8_accel_rdata;
+    wire        dot8_accel_ready;
+
+    // Mux accelerator responses
+    assign accel_reg_rdata = dma_accel_select ? dma_accel_rdata :
+                             dot8_accel_select ? dot8_accel_rdata : 32'h0;
+    assign accel_reg_ready = dma_accel_select ? dma_accel_ready :
+                             dot8_accel_select ? dot8_accel_ready : accel_reg_valid;
 
     // VexRiscv CPU system - run at 133 MHz (same as SDRAM controller, no CDC needed)
     cpu_system cpu (
@@ -820,7 +838,7 @@ assign video_hs = vidout_hs;
         .accel_reg_ready(accel_reg_ready)
     );
 
-    // DMA Dot Product Accelerator
+    // DMA Dot Product Accelerator (0x50000000)
     // Has direct access to SDRAM burst interface for high-bandwidth data transfer
     dma_dot_product #(
         .MAX_LENGTH(256)
@@ -828,12 +846,12 @@ assign video_hs = vidout_hs;
         .clk(clk_ram_controller),
         .reset_n(reset_n),
         // CPU register interface
-        .reg_valid(accel_reg_valid),
+        .reg_valid(accel_reg_valid && dma_accel_select),
         .reg_write(accel_reg_write),
-        .reg_addr(accel_reg_addr),
+        .reg_addr(accel_reg_addr[7:0]),
         .reg_wdata(accel_reg_wdata),
-        .reg_rdata(accel_reg_rdata),
-        .reg_ready(accel_reg_ready),
+        .reg_rdata(dma_accel_rdata),
+        .reg_ready(dma_accel_ready),
         // SDRAM burst interface
         .burst_rd(dma_burst_rd),
         .burst_addr(dma_burst_addr),
@@ -842,6 +860,20 @@ assign video_hs = vidout_hs;
         .burst_data(dma_burst_data),
         .burst_data_valid(dma_burst_data_valid),
         .burst_data_done(dma_burst_data_done)
+    );
+
+    // 8-element DSP Dot Product Accelerator (0x51000000)
+    // Dedicated hardware for head_size=8 attention computation
+    dot8_accel dot8 (
+        .clk(clk_ram_controller),
+        .reset_n(reset_n),
+        // CPU register interface
+        .reg_valid(accel_reg_valid && dot8_accel_select),
+        .reg_write(accel_reg_write),
+        .reg_addr(accel_reg_addr[7:0]),
+        .reg_wdata(accel_reg_wdata),
+        .reg_rdata(dot8_accel_rdata),
+        .reg_ready(dot8_accel_ready)
     );
 
     // Terminal display (40x30 characters, 320x240 pixels)

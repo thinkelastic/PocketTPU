@@ -751,6 +751,7 @@ set_global_assignment -name VERILOG_FILE core/psram_controller.v
 set_global_assignment -name SYSTEMVERILOG_FILE core/psram.sv
 set_global_assignment -name VERILOG_FILE core/dot_product_accel.v
 set_global_assignment -name VERILOG_FILE core/dma_dot_product.v
+set_global_assignment -name VERILOG_FILE core/dot8_accel.v
 set_global_assignment -name VERILOG_FILE vexriscv/VexRiscv_Full.v
 set_global_assignment -name SDC_FILE core/core_constraints.sdc
 set_global_assignment -name SIGNALTAP_FILE core/stp1.stp

@@ -57,7 +57,7 @@ static void* psram_cache_alloc(size_t size) {
 
 /* Configuration - adjust these for your model */
 #define DEFAULT_STEPS       64     /* Max tokens to generate */
-#define DEFAULT_TEMPERATURE 0.0f    /* 0 = greedy sampling (deterministic) */
+#define DEFAULT_TEMPERATURE 0.3f    /* 0 = greedy sampling (deterministic) */
 #define DEFAULT_TOPP        1.0f    /* 1 = disabled */
 #define DEFAULT_PROMPT      "Once upon a time"
 
@@ -406,6 +406,7 @@ static void softmax(float* x, int size) {
 
 #if USE_DMA_ACCEL
 #include "dma_dot_accel.h"
+#include "dot8_accel.h"
 
 /* Flag to track if weights have been converted */
 static int weights_converted = 0;
@@ -556,12 +557,8 @@ static void matmul_batch(float* xout, float* w, int n, int d) {
     int32_t* w_q16 = (int32_t*)w;
 
     if (n <= DMA_DOT_MAX_LEN) {
-        /* Use simple cached-B version - pipelined has correctness issues */
-        for (int i = 0; i < d; i++) {
-            int32_t* wi = w_q16 + i * n;
-            int64_t result = dma_dot_product_q16_cached(wi, n);
-            xout[i] = Q32_TO_FLOAT(result);
-        }
+        /* Try pipelined version for better throughput */
+        matmul_batch_pipelined(xout, w, n, d);
     } else {
         /* Multiple batches needed */
         for (int i = 0; i < d; i++) {
@@ -797,7 +794,7 @@ static float* forward_gpt2(Transformer* transformer, int token, int pos) {
             s->xb2[i] += w->wqkv_bias[l*3*dim + i];
         }
 
-        /* Split Q, K, V and store K, V in cache */
+        /* Split Q, K, V and store in cache */
         int loff = l * p->seq_len * dim;
         float* q_out = s->q;
         float* k_cache_pos = s->key_cache + loff + pos * dim;
@@ -888,10 +885,6 @@ static float* forward(Transformer* transformer, int token, int pos) {
 /* ============================================
  * Tokenizer
  * ============================================ */
-
-static int compare_tokens(const void *a, const void *b) {
-    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
-}
 
 /* Read 32-bit value from potentially unaligned address using only word-aligned reads */
 static inline uint32_t read_u32(const uint8_t* ptr) {
@@ -1777,9 +1770,12 @@ static char* decode_gguf(int prev_token, int token) {
         return "(ERR)";
     }
 
-    /* GPT-2 BPE uses special byte encoding:
+    /* Handle different tokenizer encodings:
+     * GPT-2 BPE:
      * - Ġ (U+0120, UTF-8: 0xC4 0xA0) represents space
      * - Ċ (U+010A, UTF-8: 0xC4 0x8A) represents newline
+     * SentencePiece (LLaMA/TinyLlama):
+     * - ▁ (U+2581, UTF-8: 0xE2 0x96 0x81) represents space
      * Convert these back to normal characters */
     int j = 0;
     for (int i = 0; token_str[i] && j < (int)sizeof(decoded) - 1; i++) {
@@ -1790,6 +1786,10 @@ static char* decode_gguf(int prev_token, int token) {
         } else if (c == 0xC4 && (unsigned char)token_str[i+1] == 0x8A) {
             decoded[j++] = '\n'; /* Ċ -> newline */
             i++;
+        } else if (c == 0xE2 && (unsigned char)token_str[i+1] == 0x96 &&
+                   (unsigned char)token_str[i+2] == 0x81) {
+            decoded[j++] = ' ';  /* ▁ -> space (SentencePiece) */
+            i += 2;
         } else {
             decoded[j++] = token_str[i];
         }
@@ -1801,121 +1801,6 @@ static char* decode_gguf(int prev_token, int token) {
         return decoded + 1;
     }
     return decoded;
-}
-
-/* Search for token string in GGUF vocab */
-static int gguf_str_lookup(GGUFContext* ctx, const char* str) {
-    static char token_buf[64];
-    for (int i = 0; i < (int)ctx->config.vocab_size; i++) {
-        if (gguf_get_vocab_string(ctx, i, token_buf, sizeof(token_buf)) >= 0) {
-            if (strcmp(token_buf, str) == 0) {
-                return i;
-            }
-        }
-    }
-    return -1;
-}
-
-/* Get GGUF vocab score (approximate - use token index as proxy) */
-static float gguf_get_score(GGUFContext* ctx, int id) {
-    /* llama2c tokenizer stores tokens sorted by score, so higher index = lower score */
-    /* Return negative index as proxy for score */
-    (void)ctx;
-    return -(float)id;
-}
-
-/* GGUF-based encoder using vocabulary lookup */
-static void encode_gguf(GGUFContext* ctx, char* text, int bos, int* tokens, int* n_tokens) {
-    static char str_buffer[256];
-    *n_tokens = 0;
-
-    if (bos) {
-        tokens[(*n_tokens)++] = ctx->config.bos_token_id;
-    }
-
-    if (text == NULL || text[0] == '\0') return;
-
-    /* Add dummy prefix space (like llama2c does) */
-    int space_id = gguf_str_lookup(ctx, " ");
-    if (space_id != -1) {
-        tokens[(*n_tokens)++] = space_id;
-    }
-
-    /* Encode each character, falling back to byte tokens */
-    size_t str_len = 0;
-    for (char* c = text; *c != '\0'; c++) {
-        /* Handle UTF-8 continuation bytes */
-        if ((*c & 0xC0) != 0x80) {
-            str_len = 0;
-        }
-
-        str_buffer[str_len++] = *c;
-        str_buffer[str_len] = '\0';
-
-        if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) {
-            continue;
-        }
-
-        int id = gguf_str_lookup(ctx, str_buffer);
-
-        if (id != -1) {
-            tokens[(*n_tokens)++] = id;
-        } else {
-            /* Fallback to byte tokens */
-            for (size_t i = 0; i < str_len; i++) {
-                /* Look up byte token like "<0xNN>" or single character */
-                char byte_str[8];
-                sprintf(byte_str, "<0x%02X>", (unsigned char)str_buffer[i]);
-                int byte_id = gguf_str_lookup(ctx, byte_str);
-                if (byte_id != -1) {
-                    tokens[(*n_tokens)++] = byte_id;
-                } else {
-                    /* Try single character */
-                    char single[2] = {str_buffer[i], '\0'};
-                    byte_id = gguf_str_lookup(ctx, single);
-                    if (byte_id != -1) {
-                        tokens[(*n_tokens)++] = byte_id;
-                    } else {
-                        /* Last resort: use token ID based on ASCII offset */
-                        tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
-                    }
-                }
-            }
-        }
-        str_len = 0;
-    }
-
-    /* BPE merge pass */
-    while (1) {
-        float best_score = -1e10f;
-        int best_id = -1;
-        int best_idx = -1;
-
-        static char tok_a[64], tok_b[64];
-        for (int i = 0; i < (*n_tokens - 1); i++) {
-            if (gguf_get_vocab_string(ctx, tokens[i], tok_a, sizeof(tok_a)) < 0) continue;
-            if (gguf_get_vocab_string(ctx, tokens[i+1], tok_b, sizeof(tok_b)) < 0) continue;
-
-            sprintf(str_buffer, "%s%s", tok_a, tok_b);
-            int id = gguf_str_lookup(ctx, str_buffer);
-            if (id != -1) {
-                float score = gguf_get_score(ctx, id);
-                if (score > best_score) {
-                    best_score = score;
-                    best_id = id;
-                    best_idx = i;
-                }
-            }
-        }
-
-        if (best_idx == -1) break;
-
-        tokens[best_idx] = best_id;
-        for (int i = best_idx + 1; i < (*n_tokens - 1); i++) {
-            tokens[i] = tokens[i + 1];
-        }
-        (*n_tokens)--;
-    }
 }
 
 /* Generation loop for GGUF models */

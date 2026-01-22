@@ -216,6 +216,7 @@ static inline void dma_dot_pipeline_first(int32_t* a_first, int32_t* a_next, int
  * The next A was already prefetched, so this just starts compute and prefetches a_next.
  */
 static inline int64_t dma_dot_pipeline_next(int32_t* a_next, int n) {
+    (void)n;  /* Length already set, kept for API consistency */
     dma_dot_wait();
     int64_t result = dma_dot_get_result();
 
