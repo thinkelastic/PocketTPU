@@ -81,6 +81,8 @@ typedef struct {
     int vocab_size;  /* Vocabulary size */
     int seq_len;     /* Max sequence length */
     int arch;        /* Architecture type: ARCH_LLAMA or ARCH_GPT2 */
+    int q16_native;  /* 1 = weights already in Q16.16 format (I32 tensors) */
+    int q8_native;   /* 1 = weights in Q8_0 format, use hardware dequant */
 } Config;
 
 typedef struct {
@@ -121,6 +123,17 @@ typedef struct {
     float* wo_layer[MAX_LAYERS];         /* Per-layer output projection */
     float* ffn_up_layer[MAX_LAYERS];     /* Per-layer FFN up */
     float* ffn_down_layer[MAX_LAYERS];   /* Per-layer FFN down */
+
+    /* Q8 direct pointers (for q8_native mode - weights stay in Q8 format) */
+    uint8_t* q8_wq[MAX_LAYERS];          /* Q8 attention Q weights */
+    uint8_t* q8_wk[MAX_LAYERS];          /* Q8 attention K weights */
+    uint8_t* q8_wv[MAX_LAYERS];          /* Q8 attention V weights */
+    uint8_t* q8_wo[MAX_LAYERS];          /* Q8 attention output weights */
+    uint8_t* q8_w1[MAX_LAYERS];          /* Q8 FFN gate weights */
+    uint8_t* q8_w2[MAX_LAYERS];          /* Q8 FFN down weights */
+    uint8_t* q8_w3[MAX_LAYERS];          /* Q8 FFN up weights */
+    uint8_t* q8_wcls;                    /* Q8 output projection */
+    uint8_t* q8_token_embd;              /* Q8 token embeddings (for large vocab) */
 } TransformerWeights;
 
 typedef struct {
@@ -604,6 +617,75 @@ static void matmul(float* xout, float* x, float* w, int n, int d) {
     matmul_batch(xout, w, n, d);
 }
 
+/*
+ * Q8 Matmul: Hardware dequantization of Q8 weights during DMA.
+ * Weights stay in Q8_0 format (34 bytes per 32 elements).
+ * Hardware reads Q8 blocks, extracts FP16 scale, converts to Q16.16,
+ * multiplies int8 values by scale, and computes dot product.
+ */
+
+/*
+ * Matmul with Q8 weights using previously prepared x vector.
+ * Each row of Q8 weights is at: w_q8 + row * q8_row_bytes(n)
+ */
+static void matmul_q8_batch(float* xout, uint8_t* w_q8, int n, int d) {
+    uint32_t row_stride = q8_row_bytes(n);
+
+    for (int i = 0; i < d; i++) {
+        uint8_t* row_ptr = w_q8 + i * row_stride;
+        int64_t result = dma_dot_product_q8_cached(row_ptr, n);
+        xout[i] = Q32_TO_FLOAT(result);
+    }
+}
+
+/*
+ * Full Q8 matmul: W_q8 (d,n) @ x (n,) -> xout (d,)
+ * Weights are in Q8_0 format (not converted).
+ * x is converted to Q16.16 and preloaded.
+ */
+static void matmul_q8(float* xout, float* x, uint8_t* w_q8, int n, int d) {
+    matmul_batch_begin(x, n);  /* Reuse: converts x to Q16.16 and preloads */
+    matmul_q8_batch(xout, w_q8, n, d);
+}
+
+/*
+ * Dequantize a single row of Q8 token embeddings into dest buffer.
+ * Used for token embedding lookup - only one row needed at a time.
+ * Row is at: q8_embd + row * q8_row_bytes(dim)
+ */
+static void dequant_q8_row(float* dest, uint8_t* q8_embd, int row, int dim) {
+    uint32_t row_offset = (uint32_t)row * q8_row_bytes(dim);
+    const uint8_t* src = q8_embd + row_offset;
+
+    /* Q8_0: (dim/32) blocks, each block is 34 bytes (2 scale + 32 values) */
+    int n_blocks = (dim + 31) / 32;
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t* block = src + b * 34;
+
+        /* Read FP16 scale (first 2 bytes) with alignment handling */
+        uintptr_t addr = (uintptr_t)block;
+        uintptr_t aligned = addr & ~3;
+        int offset = addr & 3;
+        uint32_t word = *(const volatile uint32_t*)aligned;
+        uint16_t scale_fp16;
+        if (offset <= 2) {
+            scale_fp16 = (word >> (offset * 8)) & 0xFFFF;
+        } else {
+            uint32_t w1 = *(const volatile uint32_t*)(aligned + 4);
+            scale_fp16 = ((word >> 24) | (w1 << 8)) & 0xFFFF;
+        }
+        float scale = fp16_to_float(scale_fp16);
+
+        /* Dequantize 32 int8 values */
+        int start_idx = b * 32;
+        int end_idx = (start_idx + 32 > dim) ? dim : start_idx + 32;
+        for (int i = start_idx; i < end_idx; i++) {
+            int8_t val = (int8_t)block[2 + (i - start_idx)];
+            dest[i] = scale * (float)val;
+        }
+    }
+}
+
 #else
 static void matmul(float* xout, float* x, float* w, int n, int d) {
     /* W (d,n) @ x (n,) -> xout (d,)
@@ -786,6 +868,120 @@ static float* forward_llama(Transformer* transformer, int token, int pos) {
     return s->logits;
 }
 
+#if USE_DMA_ACCEL
+/* LLaMA forward pass with Q8 streaming (hardware dequant) */
+static float* forward_llama_q8(Transformer* transformer, int token, int pos) {
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    float *x = s->x;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    ensure_rope_freq(head_size);
+    precompute_rope_sincos(pos, head_size);
+
+    /* Dequantize token embedding row from Q8 on-the-fly */
+    dequant_q8_row(x, w->q8_token_embd, token, dim);
+
+    for (int l = 0; l < p->n_layers; l++) {
+        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+
+        int loff = l * p->seq_len * kv_dim;
+        s->k = s->key_cache + loff + pos * kv_dim;
+        s->v = s->value_cache + loff + pos * kv_dim;
+
+        /* Batch Q/K/V projections with Q8 weights */
+        matmul_batch_begin(s->xb, dim);
+        matmul_q8_batch(s->q, w->q8_wq[l], dim, dim);
+        matmul_q8_batch(s->k, w->q8_wk[l], dim, kv_dim);
+        matmul_q8_batch(s->v, w->q8_wv[l], dim, kv_dim);
+
+        /* RoPE */
+        for (int i = 0; i < dim; i += 2) {
+            int head_dim = i % head_size;
+            int freq_idx = head_dim / 2;
+            float fcr = rope_cos_cache[freq_idx];
+            float fci = rope_sin_cache[freq_idx];
+            int rotn = i < kv_dim ? 2 : 1;
+            for (int v = 0; v < rotn; v++) {
+                float* vec = v == 0 ? s->q : s->k;
+                float v0 = vec[i];
+                float v1 = vec[i+1];
+                vec[i]   = v0 * fcr - v1 * fci;
+                vec[i+1] = v0 * fci + v1 * fcr;
+            }
+        }
+
+        /* Attention */
+        for (int h = 0; h < p->n_heads; h++) {
+            float* q = s->q + h * head_size;
+            float* att = s->att + h * p->seq_len;
+            int kv_head_offset = (h / kv_mul) * head_size;
+
+            accel_attention_scores(att, q, s->key_cache + loff, pos,
+                                   head_size, kv_dim, kv_head_offset);
+            softmax(att, pos + 1);
+
+            float* xb = s->xb + h * head_size;
+            int kv_head_off = (h / kv_mul) * head_size;
+
+            memset(xb, 0, head_size * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                float* v = s->value_cache + loff + t * kv_dim + kv_head_off;
+                float a = att[t];
+                for (int i = 0; i < head_size; i++) {
+                    xb[i] += a * v[i];
+                }
+            }
+        }
+
+        /* Output projection with Q8 weights */
+        matmul_q8(s->xb2, s->xb, w->q8_wo[l], dim, dim);
+
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
+
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+
+        /* FFN with Q8 weights */
+        matmul_batch_begin(s->xb, dim);
+        matmul_q8_batch(s->hb, w->q8_w1[l], dim, hidden_dim);
+        matmul_q8_batch(s->hb2, w->q8_w3[l], dim, hidden_dim);
+
+        /* SwiGLU activation */
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = s->hb[i];
+            val *= (1.0f / (1.0f + fast_expf(-val)));
+            val *= s->hb2[i];
+            s->hb[i] = val;
+        }
+
+        matmul_q8(s->xb, s->hb, w->q8_w2[l], hidden_dim, dim);
+
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
+    }
+
+    rmsnorm(x, x, w->rms_final_weight, dim);
+
+    /* Output projection - Q8 or tied embeddings */
+    if (w->q8_wcls) {
+        matmul_q8(s->logits, x, w->q8_wcls, p->dim, p->vocab_size);
+    } else {
+        /* Tied embeddings - wcls is float (token_embedding_table) */
+        matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    }
+
+    return s->logits;
+}
+#endif /* USE_DMA_ACCEL */
+
 /* GPT-2 forward pass (LayerNorm, learned pos emb, GELU) */
 static float* forward_gpt2(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
@@ -910,7 +1106,13 @@ static float* forward_gpt2(Transformer* transformer, int token, int pos) {
 static float* forward(Transformer* transformer, int token, int pos) {
     if (transformer->config.arch == ARCH_GPT2) {
         return forward_gpt2(transformer, token, pos);
-    } else {
+    }
+#if USE_DMA_ACCEL
+    else if (transformer->config.q8_native) {
+        return forward_llama_q8(transformer, token, pos);
+    }
+#endif
+    else {
         return forward_llama(transformer, token, pos);
     }
 }
@@ -1477,18 +1679,18 @@ static inline float read_float_aligned(const uint8_t* ptr) {
     return f;
 }
 
-/* Get direct pointer to F32 tensor data in GGUF (no copy needed if aligned)
- * Returns pointer to tensor data if F32, or NULL if conversion needed */
+/* Get direct pointer to F32 or I32 tensor data in GGUF (no copy needed if aligned)
+ * Returns pointer to tensor data if F32 or I32, or NULL if conversion needed */
 static float* get_tensor_direct(GGUFContext* ctx, const char* name, GGUFTensorInfo* out_info) {
     if (gguf_find_tensor(ctx, name, out_info) != 0) {
         return NULL;  /* Not found */
     }
 
-    /* Only return direct pointer for F32 tensors that are 4-byte aligned */
-    if (out_info->type == GGML_TYPE_F32) {
+    /* Return direct pointer for F32 or I32 (Q16.16) tensors that are 4-byte aligned */
+    if (out_info->type == GGML_TYPE_F32 || out_info->type == GGML_TYPE_I32) {
         const uint8_t* ptr = gguf_get_tensor_data(ctx, out_info);
         if (((uintptr_t)ptr & 3) == 0) {
-            return (float*)ptr;  /* Aligned F32 - can use directly */
+            return (float*)ptr;  /* Aligned 32-bit - can use directly */
         }
     }
 
@@ -1525,6 +1727,41 @@ static int load_tensor_to_buffer(GGUFContext* ctx, const char* name, float* dest
             }
             dest[i] = fp16_to_float(h);
         }
+    } else if (info.type == GGML_TYPE_I32) {
+        /* I32 = Q16.16 fixed-point, already in native format
+         * Copy directly as 32-bit values (reinterpret as float for storage) */
+        int32_t* dest_i32 = (int32_t*)dest;
+        for (int i = 0; i < count; i++) {
+            dest_i32[i] = (int32_t)read_u32(src + i * 4);
+        }
+    } else if (info.type == GGML_TYPE_Q8_0) {
+        /* Q8_0: 34 bytes per 32 elements (2-byte FP16 scale + 32 int8 values)
+         * Dequantize to float for token embedding lookup */
+        int n_blocks = (count + 31) / 32;
+        for (int b = 0; b < n_blocks; b++) {
+            const uint8_t* block = src + b * 34;
+            /* Read FP16 scale */
+            uintptr_t addr = (uintptr_t)block;
+            uintptr_t aligned = addr & ~3;
+            int offset = addr & 3;
+            uint32_t word = *(const volatile uint32_t*)aligned;
+            uint16_t scale_fp16;
+            if (offset <= 2) {
+                scale_fp16 = (word >> (offset * 8)) & 0xFFFF;
+            } else {
+                uint32_t w1 = *(const volatile uint32_t*)(aligned + 4);
+                scale_fp16 = ((word >> 24) | (w1 << 8)) & 0xFFFF;
+            }
+            float scale = fp16_to_float(scale_fp16);
+
+            /* Dequantize 32 int8 values */
+            int start_idx = b * 32;
+            int end_idx = (start_idx + 32 > count) ? count : start_idx + 32;
+            for (int i = start_idx; i < end_idx; i++) {
+                int8_t val = (int8_t)block[2 + (i - start_idx)];
+                dest[i] = scale * (float)val;
+            }
+        }
     } else {
         return -2;  /* Unsupported type */
     }
@@ -1551,6 +1788,118 @@ static float* get_or_load_tensor(GGUFContext* ctx, const char* name, int count, 
         return NULL;
     }
     return ptr;
+}
+
+/* Get direct pointer to Q8_0 tensor data in GGUF (no allocation needed) */
+static uint8_t* get_q8_tensor_direct(GGUFContext* ctx, const char* name) {
+    GGUFTensorInfo info;
+    if (gguf_find_tensor(ctx, name, &info) != 0) {
+        return NULL;  /* Not found */
+    }
+    if (info.type != GGML_TYPE_Q8_0) {
+        return NULL;  /* Not Q8 */
+    }
+    return (uint8_t*)gguf_get_tensor_data(ctx, &info);
+}
+
+/* Build LLaMA transformer from GGUF with Q8 streaming (no weight allocation) */
+static int build_llama_from_gguf_q8(Transformer* t, GGUFContext* ctx) {
+    int dim = t->config.dim;
+    int n_layers = t->config.n_layers;
+    int vocab_size = t->config.vocab_size;
+
+    printf("Q8 streaming mode: weights stay in Q8 format\n");
+
+    /* Token embeddings - keep as Q8, dequantize one row at a time during forward */
+    t->weights.q8_token_embd = get_q8_tensor_direct(ctx, "token_embd.weight");
+    if (!t->weights.q8_token_embd) {
+        printf("  FAILED: token_embd Q8 pointer\n");
+        return -1;
+    }
+    t->weights.token_embedding_table = NULL;  /* No float table - use Q8 */
+    printf("  Token embeddings [%d x %d] Q8 direct\n", vocab_size, dim);
+
+    /* RMSNorm weights - allocate and load (small: layers*dim floats) */
+    t->weights.rms_att_weight = sdram_alloc(n_layers * dim * sizeof(float));
+    t->weights.rms_ffn_weight = sdram_alloc(n_layers * dim * sizeof(float));
+    if (!t->weights.rms_att_weight || !t->weights.rms_ffn_weight) {
+        printf("  FAILED: RMSNorm alloc\n");
+        return -1;
+    }
+
+    /* Set contiguous weight pointers to NULL - we use Q8 per-layer pointers */
+    t->weights.wq = NULL;
+    t->weights.wk = NULL;
+    t->weights.wv = NULL;
+    t->weights.wo = NULL;
+    t->weights.w1 = NULL;
+    t->weights.w2 = NULL;
+    t->weights.w3 = NULL;
+
+    /* Load RMSNorm and get Q8 pointers for each layer */
+    char tensor_name[64];
+    for (int l = 0; l < n_layers; l++) {
+        sprintf(tensor_name, "blk.%d.attn_norm.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.rms_att_weight + l * dim, dim);
+
+        /* Q8 weight pointers - no allocation, just store GGUF data pointers */
+        sprintf(tensor_name, "blk.%d.attn_q.weight", l);
+        t->weights.q8_wq[l] = get_q8_tensor_direct(ctx, tensor_name);
+        if (!t->weights.q8_wq[l]) { printf("  FAILED: %s\n", tensor_name); return -1; }
+
+        sprintf(tensor_name, "blk.%d.attn_k.weight", l);
+        t->weights.q8_wk[l] = get_q8_tensor_direct(ctx, tensor_name);
+        if (!t->weights.q8_wk[l]) { printf("  FAILED: %s\n", tensor_name); return -1; }
+
+        sprintf(tensor_name, "blk.%d.attn_v.weight", l);
+        t->weights.q8_wv[l] = get_q8_tensor_direct(ctx, tensor_name);
+        if (!t->weights.q8_wv[l]) { printf("  FAILED: %s\n", tensor_name); return -1; }
+
+        sprintf(tensor_name, "blk.%d.attn_output.weight", l);
+        t->weights.q8_wo[l] = get_q8_tensor_direct(ctx, tensor_name);
+        if (!t->weights.q8_wo[l]) { printf("  FAILED: %s\n", tensor_name); return -1; }
+
+        sprintf(tensor_name, "blk.%d.ffn_norm.weight", l);
+        load_tensor_to_buffer(ctx, tensor_name, t->weights.rms_ffn_weight + l * dim, dim);
+
+        sprintf(tensor_name, "blk.%d.ffn_gate.weight", l);
+        t->weights.q8_w1[l] = get_q8_tensor_direct(ctx, tensor_name);
+        if (!t->weights.q8_w1[l]) { printf("  FAILED: %s\n", tensor_name); return -1; }
+
+        sprintf(tensor_name, "blk.%d.ffn_down.weight", l);
+        t->weights.q8_w2[l] = get_q8_tensor_direct(ctx, tensor_name);
+        if (!t->weights.q8_w2[l]) { printf("  FAILED: %s\n", tensor_name); return -1; }
+
+        sprintf(tensor_name, "blk.%d.ffn_up.weight", l);
+        t->weights.q8_w3[l] = get_q8_tensor_direct(ctx, tensor_name);
+        if (!t->weights.q8_w3[l]) { printf("  FAILED: %s\n", tensor_name); return -1; }
+
+        if ((l + 1) % 2 == 0 || l == n_layers - 1) {
+            printf("  Mapped layer %d/%d (Q8 direct)\n", l + 1, n_layers);
+        }
+    }
+
+    /* Final RMSNorm */
+    t->weights.rms_final_weight = sdram_alloc(dim * sizeof(float));
+    if (!t->weights.rms_final_weight) {
+        printf("  FAILED: final RMSNorm alloc\n");
+        return -1;
+    }
+    load_tensor_to_buffer(ctx, "output_norm.weight", t->weights.rms_final_weight, dim);
+
+    /* Output projection - check if it exists or use tied weights (Q8) */
+    t->weights.q8_wcls = get_q8_tensor_direct(ctx, "output.weight");
+    if (t->weights.q8_wcls) {
+        printf("  Output projection: Q8 direct\n");
+    } else {
+        /* No output.weight - tied to token embeddings (also Q8) */
+        t->weights.q8_wcls = t->weights.q8_token_embd;
+        printf("  Output projection: tied to Q8 embeddings\n");
+    }
+    t->weights.wcls = NULL;  /* No float wcls in Q8 mode */
+
+    printf("  Q8 model loaded - weights stream from GGUF\n");
+    return 0;
 }
 
 /* Build LLaMA transformer from GGUF file */
@@ -1766,6 +2115,20 @@ static int build_transformer_from_gguf(Transformer* t, GGUFContext* ctx) {
     t->config.n_kv_heads = gc->n_kv_heads;
     t->config.vocab_size = gc->vocab_size;
     t->config.seq_len = gc->seq_len;
+    t->config.q16_native = 0;  /* Default: weights need conversion */
+    t->config.q8_native = 0;   /* Default: not Q8 streaming */
+
+    /* Check weight tensor type */
+    GGUFTensorInfo test_info;
+    if (gguf_find_tensor(ctx, "token_embd.weight", &test_info) == 0) {
+        if (test_info.type == GGML_TYPE_I32) {
+            t->config.q16_native = 1;
+            printf("Q16.16 native weights detected - no conversion needed\n");
+        } else if (test_info.type == GGML_TYPE_Q8_0) {
+            t->config.q8_native = 1;
+            printf("Q8 native weights detected - using hardware dequant\n");
+        }
+    }
 
     /* Set architecture based on GGUF metadata */
     if (gc->arch == GGUF_ARCH_GPT2) {
@@ -1779,6 +2142,8 @@ static int build_transformer_from_gguf(Transformer* t, GGUFContext* ctx) {
     int ret;
     if (t->config.arch == ARCH_GPT2) {
         ret = build_gpt2_from_gguf(t, ctx);
+    } else if (t->config.q8_native) {
+        ret = build_llama_from_gguf_q8(t, ctx);  /* Q8 streaming mode */
     } else {
         ret = build_llama_from_gguf(t, ctx);
     }
@@ -2004,9 +2369,17 @@ void llama_main(void) {
         }
     }
 
-    /* Convert weight matrices from float to Q16.16 for hardware accelerator */
-    printf("Converting weights...\n");
-    {
+    /* Convert weight matrices from float to Q16.16 for hardware accelerator
+     * Skip if weights are already in Q16.16 format (q16_native mode)
+     * Skip if weights are Q8 (q8_native mode - hardware dequant) */
+    if (transformer.config.q16_native) {
+        printf("Weights already in Q16.16 format - skipping conversion\n");
+        weights_converted = 1;
+    } else if (transformer.config.q8_native) {
+        printf("Q8 streaming mode - hardware dequant, skipping conversion\n");
+        weights_converted = 1;
+    } else {
+        printf("Converting weights to Q16.16...\n");
         Config* p = &transformer.config;
         TransformerWeights* w = &transformer.weights;
         int head_size = p->dim / p->n_heads;
@@ -2062,7 +2435,9 @@ void llama_main(void) {
         }
 
         weights_converted = 1;
+    }
 
+    {
         /* BRAM weight cache - currently disabled
          * Single cache slot (16KB) can hold one 64x64 matrix.
          * Per-layer reload adds too much overhead.

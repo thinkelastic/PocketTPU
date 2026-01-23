@@ -73,6 +73,7 @@ static inline void dma_dot_wait(void) {
 #define DMA_DOT_CTRL_PRELOAD_B   (1 << 2)  // Preload B only, no compute
 #define DMA_DOT_CTRL_PIPELINE    (1 << 3)  // Pipeline mode: prefetch next A while computing
 #define DMA_DOT_CTRL_USE_CACHE   (1 << 4)  // Use BRAM weight cache for A (skip SDRAM fetch)
+#define DMA_DOT_CTRL_Q8_MODE     (1 << 5)  // Q8 dequantization mode: read Q8 and dequant in HW
 
 // Status register bits (read from CTRL)
 #define DMA_DOT_STATUS_BUSY      (1 << 0)  // Accelerator is busy
@@ -357,6 +358,55 @@ static inline int64_t dma_dot_product_full_cached(int slot, int n) {
     dma_cache_select(slot);
     dma_dot_set_length(n);
     dma_dot_start_cached_weights();
+    dma_dot_wait();
+    return dma_dot_get_result();
+}
+
+/*
+ * ============================================================================
+ * Q8 DIRECT MODE API
+ * ============================================================================
+ * Q8_0 format: 34 bytes per 32 elements (2-byte FP16 scale + 32 int8 values)
+ * Hardware dequantizes Q8 to Q16.16 on-the-fly during DMA fetch.
+ * This allows using Q8 weights directly from GGUF without CPU conversion.
+ *
+ * Q8 byte address calculation:
+ *   For element index i, Q8 block is at: (i / 32) * 34 bytes from weight start
+ */
+
+// Calculate Q8 byte offset for a row of weights
+// Each row of n elements spans (n / 32) Q8 blocks = (n / 32) * 34 bytes
+static inline uint32_t q8_row_bytes(int n_elements) {
+    return ((n_elements + 31) / 32) * 34;
+}
+
+// Convert Q8 data pointer to SDRAM byte address for accelerator
+// Note: Q8 uses byte addresses since blocks are 34 bytes (not word-aligned)
+static inline uint32_t ptr_to_sdram_byte_addr(void* ptr) {
+    return (uintptr_t)ptr - SDRAM_BASE;
+}
+
+// Start Q8 mode computation with cached B
+static inline void dma_dot_start_q8_cached(void) {
+    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_USE_CACHED | DMA_DOT_CTRL_Q8_MODE;
+}
+
+/*
+ * Compute dot product with Q8 weights (dequantized in hardware) and cached B.
+ * Weights are in Q8_0 format directly from GGUF.
+ * B vector must have been preloaded with dma_dot_preload_b_vector().
+ *
+ * Parameters:
+ *   a_q8: Pointer to Q8 weights in SDRAM (Q8_0 format)
+ *   n:    Number of elements
+ *
+ * Returns: 64-bit Q32.32 result
+ */
+static inline int64_t dma_dot_product_q8_cached(uint8_t* a_q8, int n) {
+    // For Q8, use byte address (divided by 2 to convert to 16-bit word address)
+    REG32(DMA_DOT_ADDR_A) = ptr_to_sdram_byte_addr(a_q8) >> 1;
+    dma_dot_set_length(n);
+    dma_dot_start_q8_cached();
     dma_dot_wait();
     return dma_dot_get_result();
 }

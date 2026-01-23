@@ -1,11 +1,12 @@
 //
-// DMA Dot Product Accelerator with Double-Buffering
+// DMA Dot Product Accelerator with Double-Buffering and Q8 Dequantization
 // Streams vectors directly from SDRAM using burst reads
 // Memory-mapped interface at 0x50000000
 //
 // Registers:
 //   0x00: CTRL       - Write to start, read for status (bit 0 = busy, bit 4 = ready for next)
 //                      Write bits: [0]=start, [1]=use_cached_b, [2]=preload_b_only, [3]=pipeline_mode
+//                                  [4]=use_weight_cache, [5]=q8_mode
 //   0x04: LENGTH     - Vector length in elements (up to 512)
 //   0x08: RESULT_LO  - Low 32 bits of accumulated result
 //   0x0C: RESULT_HI  - High 32 bits of accumulated result
@@ -13,16 +14,15 @@
 //   0x14: ADDR_B     - SDRAM word address for vector B (24-bit)
 //   0x18: ADDR_A_NEXT - Next A address for pipelined operation
 //
-// Operation modes:
-//   Normal (CTRL=1): Fetch A and B from SDRAM, compute dot product
-//   Preload B (CTRL=5): Fetch B into cache, no computation
-//   Use cached B (CTRL=3): Fetch only A, use cached B, compute dot product
-//   Pipeline (CTRL=0xB): Use cached B, start fetching next A while computing current
+// Q8 Mode (bit 5):
+//   Q8_0 format: 34 bytes per 32 elements (2-byte FP16 scale + 32 int8 values)
+//   Hardware dequantizes on-the-fly during DMA fetch
+//   For 512 elements: 16 blocks x 34 bytes = 544 bytes = 272 x 16-bit words
 //
 // Double-buffering: While computing dot product with buffer 0, DMA fills buffer 1
 // This overlaps memory latency with computation for ~2x throughput
 //
-// Vectors are Q16.16 fixed-point (pre-converted by firmware)
+// Vectors are Q16.16 fixed-point (either pre-converted or Q8-dequantized in hardware)
 // Result is 64-bit to handle overflow from accumulation
 //
 
@@ -68,6 +68,9 @@ reg preload_b_only;         // Only preload B, no computation
 reg pipeline_mode;          // Enable double-buffering pipeline
 reg [9:0] cached_b_length;  // Length of cached B vector
 
+// Q8 mode
+reg q8_mode;                // Enable Q8 dequantization
+
 // Double-buffer control
 reg active_buf;             // Which buffer is being used for compute (0 or 1)
 reg prefetch_pending;       // A prefetch is in progress
@@ -87,6 +90,8 @@ localparam STATE_WAIT_PREFETCH  = 4'd8;  // Wait for prefetch to complete
 localparam STATE_CACHE_LOAD     = 4'd9;  // Start DMA for cache load
 localparam STATE_CACHE_WAIT     = 4'd10; // Wait for cache load to complete
 localparam STATE_CACHE_PRIME    = 4'd11; // Prime cache read pipeline (1 cycle delay)
+localparam STATE_FETCH_A_Q8     = 4'd12; // Start Q8 fetch
+localparam STATE_WAIT_A_Q8      = 4'd13; // Wait for Q8 data and dequantize
 
 reg [3:0] state;
 
@@ -126,8 +131,81 @@ reg pipe1_valid;
 reg signed [63:0] prod0, prod1;
 reg pipe2_valid;
 
-// Use burst_32bit for 32-bit transfers
-assign burst_32bit = 1'b1;
+// ==========================================================================
+// Q8 Dequantization Logic
+// Q8_0 format: 2-byte FP16 scale + 32 int8 values = 34 bytes per block
+// We read 17 x 16-bit words per block (34 bytes)
+// Word 0: FP16 scale
+// Words 1-16: 32 x int8 values (2 per word)
+// ==========================================================================
+
+// Q8 block state
+reg [4:0] q8_block_idx;       // Current block (0-15 for 512 elements)
+reg [4:0] q8_word_in_block;   // Word within block (0-16)
+reg signed [31:0] q8_scale_q16; // Converted Q16.16 scale
+reg [9:0] q8_elem_idx;        // Element index for storing dequantized values
+
+// FP16 to Q16.16 conversion - registered pipeline
+// Capture FP16 scale on cycle N, use converted value on cycle N+1
+reg [15:0] fp16_scale_reg;
+
+// FP16 conversion: sign(1) | exp(5) | mant(10)
+// For Q16.16: value = sign * (1 + mant/1024) * 2^(exp-15) * 65536
+//                   = sign * (1024 + mant) * 2^(exp-15+16-10)
+//                   = sign * (1024 + mant) * 2^(exp-9)
+wire fp16_sign = fp16_scale_reg[15];
+wire [4:0] fp16_exp = fp16_scale_reg[14:10];
+wire [9:0] fp16_mant = fp16_scale_reg[9:0];
+wire [10:0] fp16_mant_full = {1'b1, fp16_mant};  // Add implicit 1
+
+// Simplified shift using case statement (synthesizes more efficiently than barrel shifter)
+reg [31:0] fp16_shifted;
+always @(*) begin
+    case (fp16_exp)
+        5'd0:  fp16_shifted = 32'd0;  // Zero/subnormal
+        5'd1:  fp16_shifted = {24'b0, fp16_mant_full[10:3]};   // exp-9 = -8
+        5'd2:  fp16_shifted = {23'b0, fp16_mant_full[10:2]};   // exp-9 = -7
+        5'd3:  fp16_shifted = {22'b0, fp16_mant_full[10:1]};   // exp-9 = -6
+        5'd4:  fp16_shifted = {21'b0, fp16_mant_full};         // exp-9 = -5
+        5'd5:  fp16_shifted = {20'b0, fp16_mant_full, 1'b0};   // exp-9 = -4
+        5'd6:  fp16_shifted = {19'b0, fp16_mant_full, 2'b0};   // exp-9 = -3
+        5'd7:  fp16_shifted = {18'b0, fp16_mant_full, 3'b0};   // exp-9 = -2
+        5'd8:  fp16_shifted = {17'b0, fp16_mant_full, 4'b0};   // exp-9 = -1
+        5'd9:  fp16_shifted = {16'b0, fp16_mant_full, 5'b0};   // exp-9 = 0
+        5'd10: fp16_shifted = {15'b0, fp16_mant_full, 6'b0};   // exp-9 = 1
+        5'd11: fp16_shifted = {14'b0, fp16_mant_full, 7'b0};   // exp-9 = 2
+        5'd12: fp16_shifted = {13'b0, fp16_mant_full, 8'b0};   // exp-9 = 3
+        5'd13: fp16_shifted = {12'b0, fp16_mant_full, 9'b0};   // exp-9 = 4
+        5'd14: fp16_shifted = {11'b0, fp16_mant_full, 10'b0};  // exp-9 = 5
+        5'd15: fp16_shifted = {10'b0, fp16_mant_full, 11'b0};  // exp-9 = 6
+        5'd16: fp16_shifted = {9'b0, fp16_mant_full, 12'b0};   // exp-9 = 7
+        5'd17: fp16_shifted = {8'b0, fp16_mant_full, 13'b0};   // exp-9 = 8
+        5'd18: fp16_shifted = {7'b0, fp16_mant_full, 14'b0};   // exp-9 = 9
+        5'd19: fp16_shifted = {6'b0, fp16_mant_full, 15'b0};   // exp-9 = 10
+        5'd20: fp16_shifted = {5'b0, fp16_mant_full, 16'b0};   // exp-9 = 11
+        5'd21: fp16_shifted = {4'b0, fp16_mant_full, 17'b0};   // exp-9 = 12
+        default: fp16_shifted = 32'h7FFFFFFF;  // Saturate for exp >= 22
+    endcase
+end
+
+// Apply sign
+wire [31:0] q16_from_fp16 = (fp16_exp == 5'd0) ? 32'd0 :
+                            fp16_sign ? -fp16_shifted : fp16_shifted;
+
+// Int8 dequantization: result = scale_q16 * int8
+wire [15:0] q8_data_word = burst_data[15:0];
+wire signed [7:0] q8_val_lo = q8_data_word[7:0];
+wire signed [7:0] q8_val_hi = q8_data_word[15:8];
+
+// Select scale: use q16_from_fp16 for word 1 (scale just converted), else use registered scale
+wire signed [31:0] q8_active_scale = (q8_word_in_block == 5'd1) ? q16_from_fp16 : q8_scale_q16;
+
+// Dequantized values: scale * int8
+wire signed [31:0] q8_dequant_lo = q8_active_scale * q8_val_lo;
+wire signed [31:0] q8_dequant_hi = q8_active_scale * q8_val_hi;
+
+// Use burst_32bit = 0 for 16-bit transfers in Q8 mode, 1 for 32-bit
+assign burst_32bit = ~q8_mode;
 
 // Combinational ready - always respond immediately for reg access
 assign reg_ready = reg_valid;
@@ -136,7 +214,7 @@ assign reg_ready = reg_valid;
 reg [31:0] rdata_comb;
 always @(*) begin
     case (reg_addr[7:2])
-        6'h00: rdata_comb = {27'b0, ready_for_next, 3'b0, busy};  // CTRL/STATUS
+        6'h00: rdata_comb = {26'b0, q8_mode, ready_for_next, 3'b0, busy};  // CTRL/STATUS
         6'h01: rdata_comb = {22'b0, vec_length};    // LENGTH
         6'h02: rdata_comb = accumulator[31:0];      // RESULT_LO
         6'h03: rdata_comb = accumulator[63:32];     // RESULT_HI
@@ -170,6 +248,10 @@ reg signed [31:0] cache_read0_reg, cache_read1_reg;
 wire signed [31:0] weight_val0 = use_weight_cache ? cache_read0_reg : vec_a_read0;
 wire signed [31:0] weight_val1 = use_weight_cache ? cache_read1_reg : vec_a_read1;
 
+// Calculate Q8 burst length: (n_elements / 32) blocks * 17 words per block
+// For 512 elements: 16 blocks * 17 = 272 words
+wire [10:0] q8_burst_len = ((vec_length + 10'd31) >> 5) * 11'd17;
+
 // Main state machine
 always @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -182,6 +264,7 @@ always @(posedge clk or negedge reset_n) begin
         use_cached_b <= 0;
         preload_b_only <= 0;
         pipeline_mode <= 0;
+        q8_mode <= 0;
         cached_b_length <= 0;
         active_buf <= 0;
         prefetch_pending <= 0;
@@ -210,6 +293,12 @@ always @(posedge clk or negedge reset_n) begin
         cache_row_offset <= 0;
         cache_read0_reg <= 0;
         cache_read1_reg <= 0;
+        // Q8 registers
+        q8_block_idx <= 0;
+        q8_word_in_block <= 0;
+        q8_scale_q16 <= 0;
+        q8_elem_idx <= 0;
+        fp16_scale_reg <= 0;
     end else begin
         // Default: deassert burst_rd after one cycle
         burst_rd <= 0;
@@ -237,6 +326,7 @@ always @(posedge clk or negedge reset_n) begin
                         preload_b_only <= reg_wdata[2];
                         pipeline_mode <= reg_wdata[3];
                         use_weight_cache <= reg_wdata[4];  // Bit 4: use BRAM weight cache
+                        q8_mode <= reg_wdata[5];           // Bit 5: Q8 dequantization mode
                         accumulator <= 0;
                         fetch_idx <= 0;
                         comp_idx <= 0;
@@ -267,6 +357,12 @@ always @(posedge clk or negedge reset_n) begin
                             end else begin
                                 state <= STATE_COMPUTE;
                             end
+                        end else if (reg_wdata[5]) begin
+                            // Q8 mode - use special fetch states
+                            state <= STATE_FETCH_A_Q8;
+                            q8_block_idx <= 0;
+                            q8_word_in_block <= 0;
+                            q8_elem_idx <= 0;
                         end else begin
                             // Normal start - fetch A first
                             state <= STATE_FETCH_A;
@@ -516,6 +612,90 @@ always @(posedge clk or negedge reset_n) begin
                     cache_slot_valid[cache_slot] <= 1;
                     cache_load_busy <= 0;
                     state <= STATE_IDLE;
+                end
+            end
+
+            // ==========================================================================
+            // Q8 Fetch States - Read Q8 blocks and dequantize to Q16.16
+            // ==========================================================================
+
+            STATE_FETCH_A_Q8: begin
+                // Start burst read for Q8 data (16-bit words)
+                burst_rd <= 1;
+                burst_addr <= {addr_a[23:0], 1'b0};  // Byte address
+                burst_len <= q8_burst_len;           // 17 words per 32 elements
+                fetch_idx <= 0;
+                q8_block_idx <= 0;
+                q8_word_in_block <= 0;
+                q8_elem_idx <= 0;
+                state <= STATE_WAIT_A_Q8;
+            end
+
+            STATE_WAIT_A_Q8: begin
+                // Process incoming Q8 data with pipelined FP16 conversion
+                // Word 0 of each block: FP16 scale -> fp16_scale_reg
+                // Word 1: capture converted scale + first data
+                // Words 2-16: dequantize using captured scale
+
+                if (burst_data_valid) begin
+                    if (q8_word_in_block == 5'd0) begin
+                        // First word of block: FP16 scale
+                        // Register for conversion (combinational logic uses this)
+                        fp16_scale_reg <= burst_data[15:0];
+                        q8_word_in_block <= 5'd1;
+                    end else if (q8_word_in_block == 5'd1) begin
+                        // Second word: scale conversion is now valid, capture it
+                        q8_scale_q16 <= q16_from_fp16;
+                        // Store first data word (using converted scale)
+                        if (q8_elem_idx < vec_length) begin
+                            if (active_buf) begin
+                                vec_a1[q8_elem_idx] <= q8_dequant_lo;
+                                if (q8_elem_idx + 1 < vec_length)
+                                    vec_a1[q8_elem_idx + 1] <= q8_dequant_hi;
+                            end else begin
+                                vec_a0[q8_elem_idx] <= q8_dequant_lo;
+                                if (q8_elem_idx + 1 < vec_length)
+                                    vec_a0[q8_elem_idx + 1] <= q8_dequant_hi;
+                            end
+                            q8_elem_idx <= q8_elem_idx + 2;
+                        end
+                        q8_word_in_block <= 5'd2;
+                    end else begin
+                        // Data words 2-16: scale already captured
+                        if (q8_elem_idx < vec_length) begin
+                            if (active_buf) begin
+                                vec_a1[q8_elem_idx] <= q8_dequant_lo;
+                                if (q8_elem_idx + 1 < vec_length)
+                                    vec_a1[q8_elem_idx + 1] <= q8_dequant_hi;
+                            end else begin
+                                vec_a0[q8_elem_idx] <= q8_dequant_lo;
+                                if (q8_elem_idx + 1 < vec_length)
+                                    vec_a0[q8_elem_idx + 1] <= q8_dequant_hi;
+                            end
+                            q8_elem_idx <= q8_elem_idx + 2;
+                        end
+
+                        // Advance word counter
+                        if (q8_word_in_block == 5'd16) begin
+                            // End of block
+                            q8_word_in_block <= 5'd0;
+                            q8_block_idx <= q8_block_idx + 1;
+                        end else begin
+                            q8_word_in_block <= q8_word_in_block + 1;
+                        end
+                    end
+                end
+
+                if (burst_data_done) begin
+                    fetch_idx <= 0;
+                    if (use_cached_b) begin
+                        state <= STATE_COMPUTE;
+                        comp_idx <= 0;
+                        pipe1_valid <= 0;
+                        pipe2_valid <= 0;
+                    end else begin
+                        state <= STATE_FETCH_B;
+                    end
                 end
             end
 
