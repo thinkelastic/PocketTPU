@@ -73,7 +73,7 @@ static inline void dma_dot_wait(void) {
 #define DMA_DOT_CTRL_PRELOAD_B   (1 << 2)  // Preload B only, no compute
 #define DMA_DOT_CTRL_PIPELINE    (1 << 3)  // Pipeline mode: prefetch next A while computing
 #define DMA_DOT_CTRL_USE_CACHE   (1 << 4)  // Use BRAM weight cache for A (skip SDRAM fetch)
-#define DMA_DOT_CTRL_Q8_MODE     (1 << 5)  // Q8 dequantization mode: read Q8 and dequant in HW
+#define DMA_DOT_CTRL_STREAMING   (1 << 5)  // Streaming mode: compute as A arrives (no buffer)
 
 // Status register bits (read from CTRL)
 #define DMA_DOT_STATUS_BUSY      (1 << 0)  // Accelerator is busy
@@ -92,6 +92,12 @@ static inline void dma_dot_preload_b(void) {
 // Start computation using cached B (CTRL=3: use_cached_b + start)
 static inline void dma_dot_start_cached(void) {
     REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_USE_CACHED;
+}
+
+// Start streaming computation - compute as A arrives, no buffering
+// Requires B preloaded. Fastest mode: overlaps DMA with compute completely.
+static inline void dma_dot_start_streaming(void) {
+    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_USE_CACHED | DMA_DOT_CTRL_STREAMING;
 }
 
 // Set vector length
@@ -386,27 +392,16 @@ static inline uint32_t ptr_to_sdram_byte_addr(void* ptr) {
     return (uintptr_t)ptr - SDRAM_BASE;
 }
 
-// Start Q8 mode computation with cached B
-static inline void dma_dot_start_q8_cached(void) {
-    REG32(DMA_DOT_CTRL) = DMA_DOT_CTRL_START | DMA_DOT_CTRL_USE_CACHED | DMA_DOT_CTRL_Q8_MODE;
-}
-
 /*
- * Compute dot product with Q8 weights (dequantized in hardware) and cached B.
- * Weights are in Q8_0 format directly from GGUF.
- * B vector must have been preloaded with dma_dot_preload_b_vector().
+ * Compute dot product using streaming mode - overlaps DMA with compute.
+ * B must be preloaded. Computes as A arrives - no intermediate buffer.
  *
- * Parameters:
- *   a_q8: Pointer to Q8 weights in SDRAM (Q8_0 format)
- *   n:    Number of elements
- *
- * Returns: 64-bit Q32.32 result
+ * Timing: ~n cycles (vs ~1.5n for buffered mode) = ~33% faster
  */
-static inline int64_t dma_dot_product_q8_cached(uint8_t* a_q8, int n) {
-    // For Q8, use byte address (divided by 2 to convert to 16-bit word address)
-    REG32(DMA_DOT_ADDR_A) = ptr_to_sdram_byte_addr(a_q8) >> 1;
+static inline int64_t dma_dot_product_q16_streaming(int32_t* a, int n) {
+    dma_dot_set_addr_a(ptr_to_sdram_word_addr(a));
     dma_dot_set_length(n);
-    dma_dot_start_q8_cached();
+    dma_dot_start_streaming();
     dma_dot_wait();
     return dma_dot_get_result();
 }

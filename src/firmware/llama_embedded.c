@@ -440,6 +440,10 @@ static void convert_weights_to_q16(float* weights, size_t num_floats) {
  * DMA can only read from SDRAM, so we copy x here before each matmul */
 static int32_t* x_sdram_buf = NULL;
 
+/* Cached x pointer for Q8 software fallback (points to original float x) */
+static float* cached_x_float = NULL;
+static int cached_x_float_len = 0;
+
 /* SDRAM buffer for attention K vectors - copied from PSRAM for DMA access
  * Batch size chosen to balance copy overhead vs DMA efficiency */
 #define ATTN_BATCH_SIZE 16
@@ -526,6 +530,9 @@ static void matmul_batch_begin(float* x, int n) {
         dma_dot_preload_b_vector(x_sdram_buf, n);
     }
     cached_x_len = n;
+    /* Also cache for Q8 software fallback */
+    cached_x_float = x;
+    cached_x_float_len = n;
 }
 
 /*
@@ -573,8 +580,12 @@ static void matmul_batch(float* xout, float* w, int n, int d) {
     int32_t* w_q16 = (int32_t*)w;
 
     if (n <= DMA_DOT_MAX_LEN) {
-        /* Try pipelined version for better throughput */
-        matmul_batch_pipelined(xout, w, n, d);
+        /* Streaming mode: compute as A (weights) arrive, no buffering */
+        for (int i = 0; i < d; i++) {
+            int32_t* wi = w_q16 + i * n;
+            int64_t result = dma_dot_product_q16_streaming(wi, n);
+            xout[i] = Q32_TO_FLOAT(result);
+        }
     } else {
         /* Multiple batches needed */
         for (int i = 0; i < d; i++) {
@@ -624,27 +635,38 @@ static void matmul(float* xout, float* x, float* w, int n, int d) {
  * multiplies int8 values by scale, and computes dot product.
  */
 
-/*
- * Matmul with Q8 weights using previously prepared x vector.
- * Each row of Q8 weights is at: w_q8 + row * q8_row_bytes(n)
- */
-static void matmul_q8_batch(float* xout, uint8_t* w_q8, int n, int d) {
-    uint32_t row_stride = q8_row_bytes(n);
+/* Forward declaration for Q8 dequantization */
+static void dequant_q8_row(float* dest, uint8_t* q8_embd, int row, int dim);
 
+/*
+ * Matmul with Q8 weights using software dequantization.
+ * Note: Hardware Q8 mode removed due to FPGA resource constraints.
+ * Falls back to software dequant + software dot product.
+ */
+static float q8_weight_row[512];  /* Temp buffer for dequantized weights */
+
+static void matmul_q8_batch(float* xout, uint8_t* w_q8, int n, int d) {
+    /* Software fallback: dequant each row then compute dot product */
     for (int i = 0; i < d; i++) {
-        uint8_t* row_ptr = w_q8 + i * row_stride;
-        int64_t result = dma_dot_product_q8_cached(row_ptr, n);
-        xout[i] = Q32_TO_FLOAT(result);
+        /* Dequantize weight row to float */
+        dequant_q8_row(q8_weight_row, w_q8, i, n);
+
+        /* Software dot product */
+        float sum = 0.0f;
+        for (int j = 0; j < n; j++) {
+            sum += q8_weight_row[j] * cached_x_float[j];
+        }
+        xout[i] = sum;
     }
 }
 
 /*
  * Full Q8 matmul: W_q8 (d,n) @ x (n,) -> xout (d,)
- * Weights are in Q8_0 format (not converted).
- * x is converted to Q16.16 and preloaded.
+ * Weights are in Q8_0 format. Uses software dequantization.
  */
 static void matmul_q8(float* xout, float* x, uint8_t* w_q8, int n, int d) {
-    matmul_batch_begin(x, n);  /* Reuse: converts x to Q16.16 and preloads */
+    cached_x_float = x;  /* Cache x for Q8 software fallback */
+    cached_x_float_len = n;
     matmul_q8_batch(xout, w_q8, n, d);
 }
 
